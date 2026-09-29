@@ -1,0 +1,17 @@
+Package: t1-keyboard-config
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: T1 Keyboard Config contributors <t1kb@example.com>
+Depends: python3 (>= 3.9), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1
+Recommends: pipewire-utils
+Installed-Size: @SIZE@
+Description: T1 mini keyboard configurator for Linux
+ Configuration tool for the T1 mini keyboard (USB VID 1189 / PID 8890):
+ key remapping, modifier combos, media / mouse / LED actions, layer
+ switching, dial volume control and VRChat OSC bindings.
+ .
+ The tool talks to the device configuration interface through usbfs and
+ installs a udev rule scoped to this vendor / product pair, so no group
+ membership or re-login is required.

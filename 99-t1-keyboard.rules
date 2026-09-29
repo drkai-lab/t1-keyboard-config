@@ -1,0 +1,4 @@
+# T1 mini keyboard (1189:8890) - allow config access without root
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0660", GROUP="input"
+# usb device node (for SET_REPORT control transfers)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0660", GROUP="input"

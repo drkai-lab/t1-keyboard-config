@@ -1,0 +1,12 @@
+# T1 mini keyboard (VID 1189 PID 8890) - unprivileged access for t1-keyboard-config
+#
+#  * usb node        : config interface (mi_01) write path (usbfs URB)
+#  * hidraw          : raw HID access (diagnostics)
+#  * input event     : monitor daemon (dial / VRChat OSC)
+#
+# Scoped to this vendor/product pair only. MODE=0666 is intentional so the
+# tool works without re-login or group changes; see README "Security notes".
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0666", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0666", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="input", ATTRS{idVendor}=="1189", ATTRS{idProduct}=="8890", MODE="0666", GROUP="input", TAG+="uaccess"

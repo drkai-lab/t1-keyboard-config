@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=T1 Keyboard Config
+Name[ja]=T1 キーボード設定
+Exec=t1-keyboard-config
+Terminal=false
+Type=Application
+Categories=Settings;Utility;
+Keywords=keyboard;hid;t1;
+Comment=T1 mini keyboard configurator (VID 1189 / PID 8890)
+Comment[ja]=T1ミニキーボード設定ツール

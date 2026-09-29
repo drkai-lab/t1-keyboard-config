@@ -1,0 +1,1988 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""T1 MINI Keyboard configuration tool for Linux (Arch / Omarchy).
+
+Native re-implementation of the Windows "MINI KeyBoard.exe" (HIDTester)
+configuration utility. Protocol reverse-engineered from the decompiled
+original: VID=0x1189 PID=0x8890, config interface mi_01 (interface 1,
+interrupt-OUT endpoint 0x02, no kernel driver bound).
+
+Device write path uses usbfs (SUBMITURB) with a control-transfer fallback.
+Run "t1-keyboard-config --selftest" to validate the install.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "1.0.0"
+APP_NAME = "t1-keyboard-config"
+VID, PID = 0x1189, 0x8890
+CONFIG_DIR = os.path.expanduser("~/.config/t1-keyboard")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+STATE_DIR = os.path.expanduser("~/.local/state/t1-keyboard")
+LOG_FILE = os.path.join(STATE_DIR, "monitor.log")
+UDEV_RULE = "/etc/udev/rules.d/99-t1-keyboard.rules"
+CONFIG_INTERFACE = 1
+CONFIG_ENDPOINT = 0x02
+
+TYPE_KEY, TYPE_MEDIA, TYPE_MOUSE, TYPE_LED = 1, 2, 3, 8
+
+
+def load_settings():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(settings):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONFIG_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Protocol encoders (pure functions, covered by tests/test_protocol.py)
+# ---------------------------------------------------------------------------
+
+def type_byte(layer, rtype, report_id):
+    if report_id == 0:
+        return rtype & 0x0F
+    return ((layer & 0x0F) << 4) | (rtype & 0x0F)
+
+
+def key_reports(keynum, layer, report_id, keys, lone_mod=0):
+    """Build the group reports for a key assignment.
+
+    keys: [(modifier_mask, usage), ...] in firmware slot order.
+    Group 0 is the modifier-only prologue, groups 1..n carry the usages.
+    """
+    keys = list(keys)[:5]
+    count = len(keys)
+    first_mod = keys[0][0] if keys else (lone_mod & 0xFF)
+    tb = type_byte(layer, TYPE_KEY, report_id)
+    out = []
+    for idx in range(count + 1):
+        mod, usage = (first_mod, 0) if idx == 0 else keys[idx - 1]
+        out.append(bytes([keynum & 0xFF, tb, count, idx, mod & 0xFF, usage & 0xFF]))
+    return out
+
+
+MEDIA_RID = {
+    3: {"play": (205, 0), "prev": (182, 0), "next": (181, 0),
+        "mute": (226, 0), "vol_up": (233, 0), "vol_down": (234, 0)},
+    0: {"play": (64, 0), "prev": (128, 0), "next": (0, 1),
+        "mute": (4, 0), "vol_up": (2, 0), "vol_down": (1, 0)},
+    2: {"play": (0, 4), "prev": (0, 11), "next": (0, 10),
+        "mute": (0, 1), "vol_up": (64, 0), "vol_down": (128, 0)},
+}
+
+MOUSE_PAYLOAD = {
+    "left":  (1, 0, 0, 0, 0),
+    "right": (2, 0, 0, 0, 0),
+    "centre": (4, 0, 0, 0, 0),
+    "wheel_up": (0, 0, 0, 1, 0),
+    "wheel_down": (0, 0, 0, 0xFF, 0),
+    "ctrl_wheel_up": (0, 0, 1, 1, 0),
+    "ctrl_wheel_down": (0, 0, 1, 0xFF, 0),
+    "shift_wheel_up": (0, 0, 1, 2, 0),
+    "shift_wheel_down": (0, 0, 1, 0xFF, 0),
+    "alt_wheel_up": (0, 0, 1, 4, 0),
+    "alt_wheel_down": (0, 0, 1, 0xFF, 0),
+}
+
+
+def media_report(keynum, layer, report_id, action):
+    table = MEDIA_RID.get(report_id, MEDIA_RID[3])
+    b5, b6 = table[action]
+    return bytes([keynum & 0xFF, type_byte(layer, TYPE_MEDIA, report_id), b5, b6])
+
+
+def mouse_report(keynum, layer, report_id, action):
+    payload = MOUSE_PAYLOAD[action]
+    return bytes([keynum & 0xFF, type_byte(layer, TYPE_MOUSE, report_id)]) + bytes(payload)
+
+
+def led_report(layer, report_id, mode):
+    return bytes([0xB0, type_byte(layer, TYPE_LED, report_id), mode & 0x03])
+
+
+def layer_report(layer):
+    return bytes([0xA1, max(1, min(3, int(layer)))])
+
+
+def flash_report():
+    return bytes([0xAA, 0xAA])
+
+
+def flash_led_report():
+    return bytes([0xAA, 0xA1])
+
+
+def probe_report():
+    return bytes([0x00, 0x00])
+
+
+# ---------------------------------------------------------------------------
+# usbfs transport
+# ---------------------------------------------------------------------------
+
+def _IOC(dir_, type_, nr, size):
+    return (dir_ << 30) | (ord(type_) << 8) | nr | (size << 16)
+
+
+USBDEVFS_CONTROL = _IOC(3, "U", 0, 24)
+USBDEVFS_SUBMITURB = _IOC(2, "U", 10, 56)
+USBDEVFS_DISCARDURB = _IOC(0, "U", 11, 0)
+USBDEVFS_REAPURB = _IOC(1, "U", 12, 8)
+USBDEVFS_REAPURBNDELAY = _IOC(1, "U", 13, 8)
+USBDEVFS_CLAIMINTERFACE = _IOC(2, "U", 15, 4)
+USBDEVFS_RELEASEINTERFACE = _IOC(2, "U", 16, 4)
+USBDEVFS_URB_TYPE_INTERRUPT = 1
+USBDEVFS_URB_TYPE_BULK = 3
+
+URB_TYPE_ORDER = (USBDEVFS_URB_TYPE_INTERRUPT, USBDEVFS_URB_TYPE_BULK)
+
+
+class _Urb(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ubyte),
+        ("endpoint", ctypes.c_ubyte),
+        ("status", ctypes.c_int),
+        ("flags", ctypes.c_uint),
+        ("buffer", ctypes.c_void_p),
+        ("buffer_length", ctypes.c_int),
+        ("actual_length", ctypes.c_int),
+        ("start_frame", ctypes.c_int),
+        ("stream_id", ctypes.c_uint),
+        ("error_count", ctypes.c_int),
+        ("signr", ctypes.c_uint),
+        ("usercontext", ctypes.c_void_p),
+    ]
+
+
+class _Ctrl(ctypes.Structure):
+    _fields_ = [
+        ("bRequestType", ctypes.c_ubyte),
+        ("bRequest", ctypes.c_ubyte),
+        ("wValue", ctypes.c_ushort),
+        ("wIndex", ctypes.c_ushort),
+        ("wLength", ctypes.c_ushort),
+        ("timeout", ctypes.c_uint),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+def find_usb_node():
+    for entry in glob.glob("/sys/bus/usb/devices/*"):
+        if ":" in entry:
+            continue
+        try:
+            vid = int(open(os.path.join(entry, "idVendor")).read().strip(), 16)
+            pid = int(open(os.path.join(entry, "idProduct")).read().strip(), 16)
+        except OSError:
+            continue
+        if vid == VID and pid == PID:
+            try:
+                bus = int(open(os.path.join(entry, "busnum")).read())
+                dev = int(open(os.path.join(entry, "devnum")).read())
+                return bus, dev, entry
+            except OSError:
+                return None
+    return None
+
+
+def usb_node_path():
+    found = find_usb_node()
+    if not found:
+        return None
+    bus, dev, _ = found
+    return "/dev/bus/usb/%03d/%03d" % (bus, dev)
+
+
+class DeviceError(RuntimeError):
+    pass
+
+
+class T1Device:
+    """Writer for the T1 config interface (usbfs interrupt-OUT / control)."""
+
+    DEFAULT_DATA_LEN = 64
+
+    def __init__(self):
+        self.fd = None
+        self.report_id = 3
+        self.data_len = self.DEFAULT_DATA_LEN
+        self.had_report_id = True
+        self.node = None
+        self.last_error = None
+        self._urb_type = None
+        self._fail_count = 0
+
+    def is_open(self):
+        return self.fd is not None
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                fcntl.ioctl(self.fd, USBDEVFS_RELEASEINTERFACE,
+                            ctypes.c_uint(CONFIG_INTERFACE))
+            except OSError:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self.node = None
+
+    def connect(self):
+        self.close()
+        found = find_usb_node()
+        if not found:
+            self.last_error = "device-not-found"
+            return False
+        bus, dev, _ = found
+        path = "/dev/bus/usb/%03d/%03d" % (bus, dev)
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            self.last_error = "permission"
+            raise DeviceError(
+                "Permission denied on %s\n"
+                "Install the udev rule first:\n"
+                "  sudo ./install.sh\n"
+                "  (or: sudo cp 99-t1-keyboard.rules /etc/udev/rules.d/ "
+                "&& sudo udevadm control --reload-rules && sudo udevadm trigger "
+                "&& unplug/replug the keyboard)" % path)
+        except OSError as exc:
+            self.last_error = str(exc)
+            return False
+        self.node = path
+        try:
+            fcntl.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, ctypes.c_uint(CONFIG_INTERFACE))
+        except OSError as exc:
+            self.close()
+            if exc.errno == errno.EBUSY:
+                self.last_error = ("claim-failed: device busy - another "
+                                   "t1-keyboard-config window/monitor is using it")
+            else:
+                self.last_error = "claim-failed: %s" % exc
+            return False
+
+        try:
+            rid, data_len, had_id = self.read_report_descriptor()
+        except Exception:
+            rid, data_len, had_id = None, None, None
+        if rid is not None:
+            self.report_id, self.data_len, self.had_report_id = rid, data_len, had_id
+        else:
+            self.report_id, self.had_report_id = 3, True
+            self.data_len = self.DEFAULT_DATA_LEN
+        if not self.had_report_id:
+            self.report_id = 0
+        if not self.probe():
+            self.close()
+            self.last_error = "probe-failed"
+            return False
+        return True
+
+    # -- descriptor ---------------------------------------------------------
+    def control_in(self, request_type, request, wvalue, windex, length, timeout=1000):
+        buf = ctypes.create_string_buffer(length)
+        ctrl = _Ctrl(request_type, request, wvalue, windex, length, timeout,
+                     ctypes.cast(buf, ctypes.c_void_p))
+        n = fcntl.ioctl(self.fd, USBDEVFS_CONTROL, ctrl)
+        if n < 0:
+            raise OSError("control transfer failed")
+        return buf.raw[:n]
+
+    def hid_descriptor_lengths(self):
+        """{interface: wDescriptorLength} from the configuration descriptor.
+
+        The length must come from the HID descriptor: asking for a larger
+        wLength makes the T1 firmware stall the endpoint and the xHCI
+        controller eventually reports "HC died" (observed with wLength=1024).
+        """
+        try:
+            head = self.control_in(0x81, 0x06, 0x0200, 0, 9, timeout=500)
+            if len(head) < 4:
+                return {}
+            total = int.from_bytes(head[2:4], "little")
+            if total < 9:
+                return {}
+            total = min(total, 1024)
+            data = head if total == 9 else self.control_in(
+                0x81, 0x06, 0x0200, 0, total, timeout=500)
+        except OSError:
+            return {}
+        return hid_descriptor_lengths(data)
+
+    def read_report_descriptor(self):
+        lengths = self.hid_descriptor_lengths()
+        length = lengths.get(CONFIG_INTERFACE)
+        if not length and lengths:
+            length = next(iter(lengths.values()))
+        if not length:
+            return None, None, None
+        try:
+            data = self.control_in(0x81, 0x06, 0x2200, CONFIG_INTERFACE, length,
+                                   timeout=500)
+        except OSError:
+            return None, None, None
+        parsed = parse_report_descriptor(data)
+        if not parsed:
+            return None, None, None
+        outputs = parsed["outputs"]
+        if not outputs:
+            return None, None, None
+        if len(outputs) == 1:
+            rid, bits = next(iter(outputs.items()))
+        else:
+            non_zero = [r for r in outputs if r != 0]
+            rid = non_zero[0] if non_zero else 0
+            bits = outputs[rid]
+        data_bytes = max(1, (bits + 7) // 8)
+        return rid, data_bytes, rid != 0
+
+    # -- framing ------------------------------------------------------------
+    def frame(self, payload):
+        if self.had_report_id:
+            total = 1 + self.data_len
+            buf = bytearray(total)
+            buf[0] = self.report_id & 0xFF
+            body = bytes(payload)[:self.data_len]
+            buf[1:1 + len(body)] = body
+        else:
+            buf = bytearray(self.data_len)
+            body = bytes(payload)[:self.data_len]
+            buf[:len(body)] = body
+        return bytes(buf)
+
+    def _send_frame(self, frame):
+        for urb_type in self._urb_order():
+            if self._send_urb(frame, urb_type):
+                self._urb_type = urb_type
+                return True
+        return self._send_control(frame)
+
+    def _urb_order(self):
+        if self._urb_type in URB_TYPE_ORDER:
+            return (self._urb_type,)
+        return URB_TYPE_ORDER
+
+    def _send_urb(self, frame, urb_type):
+        keepalive = (ctypes.c_ubyte * len(frame)).from_buffer_copy(frame)
+        urb = _Urb()
+        urb.type = urb_type
+        urb.endpoint = CONFIG_ENDPOINT
+        urb.buffer = ctypes.addressof(keepalive)
+        urb.buffer_length = len(frame)
+        try:
+            fcntl.ioctl(self.fd, USBDEVFS_SUBMITURB, urb)
+        except OSError:
+            return False
+        deadline = time.time() + 2.0
+        slot = ctypes.c_void_p(0)
+        while time.time() < deadline:
+            try:
+                fcntl.ioctl(self.fd, USBDEVFS_REAPURBNDELAY, slot)
+                return urb.status == 0
+            except BlockingIOError:
+                time.sleep(0.01)
+            except OSError:
+                break
+        try:
+            fcntl.ioctl(self.fd, USBDEVFS_DISCARDURB, 0)
+        except OSError:
+            pass
+        return False
+
+    def _send_control(self, frame):
+        try:
+            wvalue = (0x02 << 8) | (self.report_id if self.had_report_id else 0)
+            buf = ctypes.create_string_buffer(bytes(frame), len(frame))
+            ctrl = _Ctrl(0x21, 0x09, wvalue, CONFIG_INTERFACE, len(frame), 1000,
+                         ctypes.cast(buf, ctypes.c_void_p))
+            return fcntl.ioctl(self.fd, USBDEVFS_CONTROL, ctrl) >= 0
+        except OSError:
+            return False
+
+    def write_payload(self, payload):
+        if self.fd is None:
+            return False
+        ok = self._send_frame(self.frame(payload))
+        if ok:
+            self._fail_count = 0
+            return True
+        self._fail_count += 1
+        if self._fail_count >= 3:
+            self.close()
+            self.last_error = "write-failed"
+        return False
+
+    def probe(self):
+        if not self.had_report_id:
+            candidates = [0]
+        else:
+            first = self.report_id
+            candidates = [first] + [r for r in (3, 0, 2) if r != first]
+        for rid in candidates:
+            self.report_id = rid
+            self._fail_count = 0
+            if self.write_payload(probe_report()):
+                return True
+            if self.fd is None:
+                return False
+        return False
+
+    def write_many(self, payloads):
+        for payload in payloads:
+            if not self.write_payload(payload):
+                return False
+        return True
+
+    def switch_layer(self, layer):
+        return self.write_payload(layer_report(layer))
+
+    def write_key(self, keynum, layer, keys, lone_mod=0):
+        if self.report_id != 0 and not self.switch_layer(layer):
+            return False
+        if not self.write_many(key_reports(keynum, layer, self.report_id, keys, lone_mod)):
+            return False
+        return self.write_payload(flash_report())
+
+    def write_media(self, keynum, layer, action):
+        if self.report_id != 0 and not self.switch_layer(layer):
+            return False
+        if not self.write_payload(media_report(keynum, layer, self.report_id, action)):
+            return False
+        return self.write_payload(flash_report())
+
+    def write_mouse(self, keynum, layer, action):
+        if self.report_id != 0 and not self.switch_layer(layer):
+            return False
+        if not self.write_payload(mouse_report(keynum, layer, self.report_id, action)):
+            return False
+        return self.write_payload(flash_report())
+
+    def write_led(self, layer, mode):
+        if self.report_id != 0 and not self.switch_layer(layer):
+            return False
+        if not self.write_payload(led_report(layer, self.report_id, mode)):
+            return False
+        return self.write_payload(flash_led_report())
+
+
+def parse_report_descriptor(data):
+    """Minimal HID report descriptor parser -> {"outputs": {rid: bits}}."""
+    outputs = {}
+    rid, rsize, rcount = 0, 0, 0
+    pos, size = 0, len(data)
+    while pos < size:
+        prefix = data[pos]
+        pos += 1
+        if prefix == 0xFE:
+            if pos + 2 > size:
+                break
+            long_size = data[pos]
+            pos += 3 + long_size
+            continue
+        item_size = prefix & 0x03
+        if item_size == 3:
+            item_size = 4
+        if pos + item_size > size:
+            break
+        value = int.from_bytes(data[pos:pos + item_size], "little")
+        pos += item_size
+        btype = (prefix >> 2) & 0x03
+        tag = prefix >> 4
+        if btype == 1:
+            if tag == 8:
+                rid = value
+            elif tag == 7:
+                rsize = value
+            elif tag == 9:
+                rcount = value
+        elif btype == 0:
+            if tag == 9:
+                outputs[rid] = outputs.get(rid, 0) + rsize * rcount
+    if not outputs:
+        return None
+    return {"outputs": outputs}
+
+
+def hid_descriptor_lengths(config_data):
+    """{interface_number: wDescriptorLength} for HID (0x21) descriptors.
+
+    Walks the configuration descriptor so each HID descriptor is matched with
+    the interface that precedes it.
+    """
+    lengths = {}
+    interface = -1
+    pos, size = 0, len(config_data)
+    while pos + 2 <= size:
+        length = config_data[pos]
+        dtype = config_data[pos + 1]
+        if length < 2 or pos + length > size:
+            break
+        if dtype == 0x04 and length >= 4:
+            interface = config_data[pos + 2]
+        elif dtype == 0x21 and length >= 9 and interface not in lengths:
+            report_len = int.from_bytes(config_data[pos + 7:pos + 9], "little")
+            if 16 <= report_len <= 1024:
+                lengths[interface] = report_len
+        pos += length
+    return lengths
+
+
+# ---------------------------------------------------------------------------
+# evdev helpers / input nodes
+# ---------------------------------------------------------------------------
+
+EV_SYN, EV_KEY, EV_REL = 0x1, 0x2, 0x3
+INPUT_EVENT = struct.Struct("llHHi")
+
+DIAL_DEFAULT_CODES = (6, 7, 8, 11, 12)  # REL_HWHEEL / REL_DIAL / REL_WHEEL (+hi-res)
+
+
+def t1_input_nodes():
+    nodes = []
+    for uevent in glob.glob("/sys/class/input/event*/device/uevent"):
+        try:
+            text = open(uevent).read()
+        except OSError:
+            continue
+        product = ""
+        for line in text.splitlines():
+            if line.startswith("PRODUCT="):
+                product = line.split("=", 1)[1].strip()
+                break
+        parts = product.split("/")
+        if len(parts) < 3:
+            continue
+        try:
+            if int(parts[1], 16) != VID or int(parts[2], 16) != PID:
+                continue
+        except ValueError:
+            continue
+        event = "/dev/input/" + os.path.basename(
+            os.path.dirname(os.path.dirname(uevent)))
+        name = ""
+        for line in text.splitlines():
+            if line.startswith("NAME="):
+                name = line.split("=", 1)[1].strip().strip('"')
+        nodes.append((event, name))
+    nodes.sort()
+    return nodes
+
+
+def open_input_nodes(nonblock=True):
+    fds = []
+    for path, _name in t1_input_nodes():
+        try:
+            flags = os.O_RDONLY | os.O_NONBLOCK
+            fds.append((os.open(path, flags), path))
+        except OSError:
+            continue
+    return fds
+
+
+def read_events(fd):
+    out = []
+    while True:
+        try:
+            raw = os.read(fd, INPUT_EVENT.size)
+        except BlockingIOError:
+            break
+        except OSError:
+            break
+        if len(raw) < INPUT_EVENT.size:
+            break
+        _sec, _usec, etype, code, value = INPUT_EVENT.unpack(raw)
+        out.append((etype, code, value))
+    return out
+
+
+def which_wpctl():
+    return shutil.which("wpctl")
+
+
+def wpctl_volume(target, delta=None, absolute=None):
+    if not which_wpctl():
+        return False
+    try:
+        if delta is not None:
+            result = subprocess.run(["wpctl", "get-volume", target],
+                                    capture_output=True, text=True, timeout=2)
+            current = float(result.stdout.split(":", 1)[1].strip().split()[0])
+            value = max(0.0, min(2.0, current + delta))
+            subprocess.run(["wpctl", "set-volume", target, "%.2f" % value],
+                           capture_output=True, timeout=2)
+        elif absolute is not None:
+            subprocess.run(["wpctl", "set-volume", target, "%.2f" % max(0.0, min(2.0, absolute))],
+                           capture_output=True, timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+class OscSender:
+    def __init__(self, host="127.0.0.1", port=9000):
+        self.host = host
+        self.port = int(port)
+
+    @staticmethod
+    def _pad(raw):
+        return raw + b"\x00" * ((4 - len(raw) % 4) % 4)
+
+    def send_bool(self, address, value):
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(self._pad(address.encode()) +
+                        self._pad(b",T" if value else b",F") +
+                        (b"\x01" if value else b"\x00"),
+                        (self.host, self.port))
+            sock.close()
+            return True
+        except OSError:
+            return False
+
+    def send_float(self, address, value):
+        import socket
+        import struct as _st
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(self._pad(address.encode()) + self._pad(b",f") +
+                        _st.pack(">f", float(value)), (self.host, self.port))
+            sock.close()
+            return True
+        except OSError:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Monitor daemon
+# ---------------------------------------------------------------------------
+
+def log(message):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (stamp, message))
+    except OSError:
+        pass
+
+
+def run_monitor():
+    log("monitor starting (pid %d)" % os.getpid())
+    settings = load_settings()
+    mtime = _settings_mtime()
+    osc_cfg = settings.get("osc", {})
+    osc = OscSender(osc_cfg.get("host", "127.0.0.1"), osc_cfg.get("port", 9000))
+
+    fds = []
+    bindings = {}
+    rotate_codes = set()
+    push_code = None
+    modes = ["mic", "headphone", "user"]
+    mode_idx = 0
+    user_vol = 0.5
+    prev_push = False
+
+    def reload_settings():
+        nonlocal settings, osc, bindings, rotate_codes, push_code
+        nonlocal modes, mode_idx, user_vol
+        settings = load_settings()
+        osc_cfg = settings.get("osc", {})
+        osc = OscSender(osc_cfg.get("host", "127.0.0.1"), osc_cfg.get("port", 9000))
+        bindings = {}
+        for key, cfg in settings.get("key_osc", {}).items():
+            if cfg.get("code") and cfg.get("addr"):
+                bindings[int(cfg["code"])] = (cfg["addr"], bool(cfg.get("toggle")))
+        dial = settings.get("dial", {})
+        rotate_codes = set(dial.get("rotate_codes") or list(DIAL_DEFAULT_CODES))
+        push_code = dial.get("push_code")
+        modes = dial.get("modes") or ["mic", "headphone", "user"]
+        mode_idx = int(dial.get("start_index", 0)) % max(1, len(modes))
+        user_vol = float(settings.get("_user_vol", 0.5))
+
+    reload_settings()
+    warned_empty = False
+
+    while True:
+        if not fds:
+            fds = open_input_nodes()
+            if not fds:
+                if not warned_empty:
+                    warned_empty = True
+                    log("no readable input node yet (udev rule / permissions?)")
+                time.sleep(2.0)
+                continue
+            warned_empty = False
+            log("monitor attached to " + ", ".join(p for _, p in fds))
+        if _settings_mtime() != mtime:
+            mtime = _settings_mtime()
+            reload_settings()
+
+        try:
+            ready, _, _ = select.select([fd for fd, _ in fds], [], [], 0.25)
+        except (OSError, ValueError):
+            fds = []
+            continue
+        if not ready:
+            continue
+        for fd in ready:
+            for etype, code, value in read_events(fd):
+                if etype == EV_KEY and value == 1:
+                    if push_code is not None and code == push_code:
+                        mode_idx = (mode_idx + 1) % max(1, len(modes))
+                        dial = settings.setdefault("dial", {})
+                        dial["start_index"] = mode_idx
+                        save_settings(settings)
+                        log("dial mode -> %s" % modes[mode_idx])
+                        continue
+                    if code in bindings:
+                        address, toggle = bindings[code]
+                        if toggle:
+                            state = settings.setdefault("_osc_state", {})
+                            new_state = not state.get(str(code), False)
+                            state[str(code)] = new_state
+                            save_settings(settings)
+                            osc.send_bool(address, new_state)
+                        else:
+                            osc.send_bool(address, True)
+                elif etype == EV_KEY and value == 0:
+                    if code in bindings and not bindings[code][1]:
+                        osc.send_bool(bindings[code][0], False)
+                elif etype == EV_REL and code in rotate_codes:
+                    if value == 0:
+                        continue
+                    dial = settings.get("dial", {})
+                    step = float(dial.get("step", 0.05))
+                    direction = step if value > 0 else -step
+                    mode = modes[mode_idx] if modes else "mic"
+                    if mode == "mic":
+                        wpctl_volume("@DEFAULT_AUDIO_SOURCE@", delta=direction)
+                    elif mode == "headphone":
+                        wpctl_volume("@DEFAULT_AUDIO_SINK@", delta=direction)
+                    else:
+                        user_vol = max(0.0, min(1.0, user_vol + direction))
+                        address = settings.get("osc", {}).get(
+                            "user_volume_addr", "/avatar/parameters/UserVolume")
+                        osc.send_float(address, user_vol)
+                        settings["_user_vol"] = user_vol
+                        save_settings(settings)
+
+
+def _settings_mtime():
+    try:
+        return os.stat(CONFIG_FILE).st_mtime_ns
+    except OSError:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# i18n
+# ---------------------------------------------------------------------------
+
+I18N = {
+    "en": {
+        "app": "T1 Keyboard Config",
+        "connected": "Connected", "disconnected": "Not connected",
+        "download_ok": "Write OK", "download_ng": "Write failed",
+        "download": "Write to keyboard", "clear": "Clear",
+        "disable_key": "Disable this key",
+        "page_key": "Keys", "page_fun": "Modifiers", "page_media": "Media",
+        "page_led": "LED", "page_mouse": "Mouse", "page_osc": "VRChat OSC",
+        "page_dial": "Dial", "page_about": "Help",
+        "layer": "Layer", "selected": "Selected key",
+        "current": "Current assignment (last written by this tool)",
+        "no_key": "none",
+        "pick_first": "Select a physical key first",
+        "pick_function": "Pick a function, then press Write",
+        "need_device": "Not connected",
+        "learn_key": "Learn key", "learn_push": "Learn push",
+        "learn_rotate": "Learn rotate", "learning": "Press the key on the T1 now (5s)...",
+        "learn_done": "Learned code", "learn_fail": "Nothing captured",
+        "assign_empty": "empty",
+        "help_title": "How to program a key",
+        "help_text": ("1. Choose the layer (1/2/3) at the top.\n"
+                      "2. Click a physical key on the left.\n"
+                      "3. Pick the function in the right-hand tab.\n"
+                      "4. Press 'Write to keyboard' (or double-click the row).\n\n"
+                      "The firmware stores the mapping in its own flash; the tool\n"
+                      "cannot read it back, so the 'current assignment' panel only\n"
+                      "shows what this tool has written in this session.\n\n"
+                      "VRChat OSC / Dial tabs need the monitor daemon:\n"
+                      "  t1-keyboard-config --monitor\n"
+                      "and key codes are captured with the Learn buttons."),
+        "about_text": ("T1 Keyboard Config %s\n"
+                       "Linux configuration utility for the T1 mini keyboard\n"
+                       "(VID 1189 / PID 8890), independent re-implementation of\n"
+                       "the vendor Windows tool.\n\n"
+                       "Self test: t1-keyboard-config --selftest\n"
+                       "Monitor:   t1-keyboard-config --monitor\n"
+                       "Settings:  %s") % (VERSION, CONFIG_FILE),
+        "monitor_running": "Monitor is running", "monitor_stopped": "Monitor stopped",
+        "start_monitor": "Start monitor", "stop_monitor": "Stop monitor",
+        "monitor_error": "Monitor failed to start",
+        "dial_hint": ("Dial rotate adjusts volume / OSC.\n"
+                      "Assign a mode, then use Learn for the push button."),
+        "osc_hint": "Key -> OSC address (press = TRUE / release = FALSE)",
+        "layers": ["Layer 1", "Layer 2", "Layer 3"],
+        "mode_names": ["Mic volume", "Headphone volume", "Selected user voice"],
+    },
+    "ja": {
+        "app": "T1 キーボード設定",
+        "connected": "接続中", "disconnected": "未接続",
+        "download_ok": "書き込み成功", "download_ng": "書き込み失敗",
+        "download": "書き込み", "clear": "クリア",
+        "disable_key": "このキーを無効化",
+        "page_key": "キー", "page_fun": "修飾キー", "page_media": "マルチメディア",
+        "page_led": "LED", "page_mouse": "マウス", "page_osc": "VRChat OSC",
+        "page_dial": "ダイヤル", "page_about": "ヘルプ",
+        "layer": "レイヤー", "selected": "選択中のキー",
+        "current": "現在の設定内容(このツールが書き込んだ記録)",
+        "no_key": "なし",
+        "pick_first": "先に左の物理キーを選択してください",
+        "pick_function": "機能を選んで「書き込み」を押してください",
+        "need_device": "未接続です",
+        "learn_key": "キーを学習", "learn_push": "押し込みを学習",
+        "learn_rotate": "回転を学習", "learning": "T1のキーを押してください(5秒)...",
+        "learn_done": "学習しました", "learn_fail": "取得できませんでした",
+        "assign_empty": "未設定",
+        "help_title": "キーの設定方法",
+        "help_text": ("1. 上部でレイヤー(1/2/3)を選択\n"
+                      "2. 左の物理キーを選択\n"
+                      "3. 右のタブで割り当てる機能を選択\n"
+                      "4. 「書き込み」を押す(リストのダブルクリックでも可)\n\n"
+                      "設定はキーボード本体のフラッシュに保存され、このツールでは\n"
+                      "読み戻せません。「現在の設定内容」はこのツールが書き込んだ\n"
+                      "記録のみ表示します。\n\n"
+                      "VRChat OSC / ダイヤルは監視デーモンが必要です:\n"
+                      "  t1-keyboard-config --monitor\n"
+                      "キーのコードは「学習」ボタンで取得します。"),
+        "about_text": ("T1 キーボード設定 %s\n"
+                       "T1ミニキーボード(VID 1189 / PID 8890)向け Linux 設定ツール。\n"
+                       "ベンダー製 Windows 版の非公式なLinux実装です。\n\n"
+                       "自己診断: t1-keyboard-config --selftest\n"
+                       "監視     : t1-keyboard-config --monitor\n"
+                       "設定ファイル: %s") % (VERSION, CONFIG_FILE),
+        "monitor_running": "監視中", "monitor_stopped": "監視停止",
+        "start_monitor": "監視開始", "stop_monitor": "監視停止",
+        "monitor_error": "監視を開始できませんでした",
+        "dial_hint": ("ダイヤル回転で音量/OSCを操作します。\n"
+                      "モードを選んでから押し込みを「学習」してください。"),
+        "osc_hint": "キー → OSCアドレス(押す=TRUE / 離す=FALSE)",
+        "layers": ["レイヤー1", "レイヤー2", "レイヤー3"],
+        "mode_names": ["マイク音量", "イヤーマフ音量", "選択中ユーザーの声"],
+    },
+}
+
+MODIFIERS = [
+    ("Ctrl", 0x01), ("Shift", 0x02), ("Alt", 0x04), ("Win", 0x08),
+    ("R-Ctrl", 0x10), ("R-Shift", 0x20), ("R-Alt", 0x40), ("R-Win", 0x80),
+]
+
+USAGE_KEYS = [
+    ("A", 4), ("B", 5), ("C", 6), ("D", 7), ("E", 8), ("F", 9), ("G", 10),
+    ("H", 11), ("I", 12), ("J", 13), ("K", 14), ("L", 15), ("M", 16), ("N", 17),
+    ("O", 18), ("P", 19), ("Q", 20), ("R", 21), ("S", 22), ("T", 23), ("U", 24),
+    ("V", 25), ("W", 26), ("X", 27), ("Y", 28), ("Z", 29),
+    ("1", 30), ("2", 31), ("3", 32), ("4", 33), ("5", 34), ("6", 35), ("7", 36),
+    ("8", 37), ("9", 38), ("0", 39),
+    ("Enter", 40), ("Esc", 41), ("Backspace", 42), ("Tab", 43), ("Space", 44),
+    ("-", 45), ("=", 46), ("[", 47), ("]", 48), ("\\", 49), ("#", 50),
+    (";", 51), ("'", 52), ("`", 53), (",", 54), (".", 55), ("/", 56),
+    ("CapsLock", 57),
+    ("F1", 58), ("F2", 59), ("F3", 60), ("F4", 61), ("F5", 62), ("F6", 63),
+    ("F7", 64), ("F8", 65), ("F9", 66), ("F10", 67), ("F11", 68), ("F12", 69),
+    ("PrtSc", 70), ("ScrollLock", 71), ("Pause", 72),
+    ("Insert", 73), ("Home", 74), ("PageUp", 75), ("Delete", 76), ("End", 77),
+    ("PageDown", 78), ("Right", 79), ("Left", 80), ("Down", 81), ("Up", 82),
+    ("NumLock", 83), ("Num/", 84), ("Num*", 85), ("Num-", 86), ("Num+", 87),
+    ("NumEnter", 88), ("Num1", 89), ("Num2", 90), ("Num3", 91), ("Num4", 92),
+    ("Num5", 93), ("Num6", 94), ("Num7", 95), ("Num8", 96), ("Num9", 97),
+    ("Num0", 98), ("Num.", 99), ("Menu", 101),
+]
+
+MEDIA_ACTIONS = [
+    ("play", "Play/Pause"), ("prev", "Prev Track"), ("next", "Next Track"),
+    ("mute", "Mute"), ("vol_up", "Volume +"), ("vol_down", "Volume -"),
+]
+
+MOUSE_ACTIONS = [
+    ("left", "Mouse Left"), ("right", "Mouse Right"), ("centre", "Mouse Centre"),
+    ("wheel_up", "Wheel Up"), ("wheel_down", "Wheel Down"),
+    ("ctrl_wheel_up", "Ctrl + Wheel Up"), ("ctrl_wheel_down", "Ctrl + Wheel Down"),
+    ("shift_wheel_up", "Shift + Wheel Up"), ("shift_wheel_down", "Shift + Wheel Down"),
+    ("alt_wheel_up", "Alt + Wheel Up"), ("alt_wheel_down", "Alt + Wheel Down"),
+]
+
+LED_MODES = [(0, "Mode 1 (Off/Static)"), (1, "Mode 2 (Breathing)"), (2, "Mode 3 (Wave)")]
+
+PHYS_KEYS = [("KEY%d" % i, i) for i in range(1, 13)] + [
+    ("K1-L", 13), ("K1-C", 14), ("K1-R", 15),
+    ("K2-L", 16), ("K2-C", 17), ("K2-R", 18),
+]
+
+DIAL_MODES = [
+    {"id": "mic", "en": "Mic volume", "ja": "マイク音量"},
+    {"id": "headphone", "en": "Headphone volume", "ja": "イヤーマフ音量"},
+    {"id": "user", "en": "Selected user voice", "ja": "選択中ユーザーの声"},
+]
+
+
+def monitor_is_running():
+    try:
+        out = subprocess.run(["pgrep", "-f", "%s --monitor" % APP_NAME],
+                             capture_output=True, text=True, timeout=3)
+        return bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def start_monitor_process():
+    if not which_wpctl():
+        return False, "wpctl not found (install pipewire-utils)"
+    try:
+        script = os.path.abspath(globals().get("__file__", sys.argv[0]))
+        subprocess.Popen([sys.executable, script, "--monitor"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def stop_monitor_process():
+    try:
+        subprocess.run(["pkill", "-f", "%s --monitor" % APP_NAME],
+                       capture_output=True, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# GTK UI
+# ---------------------------------------------------------------------------
+
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Gtk, Adw, GLib
+
+    class LearnThread(threading.Thread):
+        def __init__(self, seconds, want_key=True, want_rel=False, ignore=()):
+            super().__init__(daemon=True)
+            self.seconds = seconds
+            self.want_key = want_key
+            self.want_rel = want_rel
+            self.ignore = set(ignore)
+            self.result = None
+            self.done = False
+
+        def run(self):
+            fds = open_input_nodes()
+            if not fds:
+                self.done = True
+                return
+            deadline = time.time() + self.seconds
+            while time.time() < deadline:
+                try:
+                    ready, _, _ = select.select([fd for fd, _ in fds], [], [],
+                                                max(0.0, deadline - time.time()))
+                except (OSError, ValueError):
+                    break
+                for fd in ready:
+                    for etype, code, value in read_events(fd):
+                        if value != 1:
+                            continue
+                        if etype == EV_KEY and self.want_key and code not in self.ignore:
+                            self.result = ("key", code)
+                            self.done = True
+                            return
+                        if etype == EV_REL and self.want_rel:
+                            self.result = ("rel", code)
+                            self.done = True
+                            return
+            self.done = True
+
+    class MainWindow(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title=I18N["en"]["app"])
+            self.set_default_size(980, 700)
+            self.dev = T1Device()
+            self.settings = load_settings()
+            self.lang = self.settings.get("lang", "ja")
+            self.layer = int(self.settings.get("layer", 1)) or 1
+            self.selected_key = None
+            self.pending = None
+            self.groups = []
+            self.group_mod = 0
+            self._learn = None
+            self._last_conn = False
+            self._tried_permission = False
+            self._last_error = None
+
+            hb = Adw.HeaderBar()
+            self.title_label = Gtk.Label()
+            hb.set_title_widget(self.title_label)
+            self.lang_btn = Gtk.Button(label="EN")
+            self.lang_btn.connect("clicked", self.on_toggle_lang)
+            hb.pack_end(self.lang_btn)
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            outer.set_margin_top(8)
+            outer.set_margin_bottom(8)
+            outer.set_margin_start(8)
+            outer.set_margin_end(8)
+
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            self.status_dot = Gtk.Label(label="●")
+            self.status_txt = Gtk.Label()
+            top.append(self.status_dot)
+            top.append(self.status_txt)
+            self.layer_label = Gtk.Label()
+            top.append(self.layer_label)
+            self.layer_dd = Gtk.DropDown(model=Gtk.StringList.new(["1", "2", "3"]))
+            self.layer_dd.set_selected(self.layer - 1)
+            self.layer_dd.connect("notify::selected", self.on_layer_changed)
+            top.append(self.layer_dd)
+            help_btn = Gtk.Button(label="?")
+            help_btn.connect("clicked", self.on_help)
+            top.append(help_btn)
+            self.toast = Gtk.Label(label="", hexpand=True, xalign=1)
+            top.append(self.toast)
+            outer.append(top)
+
+            body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            body.set_vexpand(True)
+
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            self.key_label = Gtk.Label(xalign=0)
+            left.append(self.key_label)
+            flow = Gtk.FlowBox()
+            flow.set_min_children_per_line(3)
+            flow.set_max_children_per_line(6)
+            flow.set_selection_mode(Gtk.SelectionMode.NONE)
+            self.key_buttons = {}
+            for name, num in PHYS_KEYS:
+                button = Gtk.Button(label=name)
+                button.add_css_class("osd")
+                button.connect("clicked", self.on_pick_key, num)
+                self.key_buttons[num] = button
+                flow.append(button)
+            left.append(flow)
+
+            self.assign_label = Gtk.Label(xalign=0)
+            self.assign_label.set_wrap(True)
+            left.append(self.assign_label)
+
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.dl_btn = Gtk.Button()
+            self.dl_btn.add_css_class("suggested-action")
+            self.dl_btn.connect("clicked", self.on_download)
+            actions.append(self.dl_btn)
+            clear_btn = Gtk.Button()
+            clear_btn.connect("clicked", self.on_clear)
+            self.clear_btn = clear_btn
+            actions.append(clear_btn)
+            self.disable_btn = Gtk.Button()
+            self.disable_btn.connect("clicked", self.on_disable)
+            left.append(actions)
+            left.append(self.disable_btn)
+            body.append(left)
+
+            self.notebook = Gtk.Notebook()
+            self.notebook.set_vexpand(True)
+            self.pages = {}
+
+            self.notebook.append_page(*self.build_key_page())
+            self.notebook.append_page(*self.build_modifier_page())
+            self.notebook.append_page(*self.build_media_page())
+            self.notebook.append_page(*self.build_mouse_page())
+            self.notebook.append_page(*self.build_led_page())
+            self.notebook.append_page(*self.build_osc_page())
+            self.notebook.append_page(*self.build_dial_page())
+            self.notebook.append_page(*self.build_about_page())
+            body.append(self.notebook)
+            outer.append(body)
+
+            self.scroller = Gtk.ScrolledWindow()
+            self.scroller.set_child(outer)
+            self.set_content(self.scroller)
+            self.apply_lang()
+            self.refresh_assignment()
+            GLib.timeout_add_seconds(1, self.tick_connect)
+
+        # -- pages ---------------------------------------------------------
+        def build_key_page(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.set_vexpand(True)
+            self.basic_list = Gtk.ListBox()
+            self.basic_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            self.basic_list.connect("row-activated", self.on_basic_activated)
+            for label, usage in USAGE_KEYS:
+                row = Gtk.ListBoxRow()
+                row.usage = usage
+                row.set_child(Gtk.Label(label=label, xalign=0))
+                self.basic_list.append(row)
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_child(self.basic_list)
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_vexpand(True)
+            box.append(scroll)
+            self.pages["key"] = box
+            return box, Gtk.Label()
+
+        def build_modifier_page(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_margin_top(8)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            grid = Gtk.FlowBox()
+            grid.set_max_children_per_line(4)
+            grid.set_selection_mode(Gtk.SelectionMode.NONE)
+            self.mod_checks = {}
+            for name, mask in MODIFIERS:
+                check = Gtk.CheckButton(label=name)
+                check.mask = mask
+                self.mod_checks[mask] = check
+                grid.append(check)
+            box.append(grid)
+            box.append(Gtk.Label(label="Base key / ベースキー", xalign=0))
+            self.base_dd = Gtk.DropDown(
+                model=Gtk.StringList.new(["(modifier only) / 修飾のみ"] +
+                                         [name for name, _ in USAGE_KEYS]))
+            box.append(self.base_dd)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            add_btn = Gtk.Button(label="+ Add group / グループ追加")
+            add_btn.connect("clicked", self.on_add_group)
+            row.append(add_btn)
+            reset_btn = Gtk.Button(label="Reset / リセット")
+            reset_btn.connect("clicked", self.on_reset_groups)
+            row.append(reset_btn)
+            box.append(row)
+            scroll_groups = Gtk.ScrolledWindow()
+            self.groups_list = Gtk.ListBox()
+            self.groups_list.set_selection_mode(Gtk.SelectionMode.NONE)
+            scroll_groups.set_child(self.groups_list)
+            scroll_groups.set_vexpand(True)
+            box.append(scroll_groups)
+            self.pages["fun"] = box
+            return box, Gtk.Label()
+
+        def build_media_page(self):
+            media_list = Gtk.ListBox()
+            media_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            media_list.connect("row-activated", self.on_media_activated)
+            for action, label in MEDIA_ACTIONS:
+                row = Gtk.ListBoxRow()
+                row.action = action
+                row.desc = label
+                row.set_child(Gtk.Label(label=label, xalign=0))
+                media_list.append(row)
+            self.pages["media"] = media_list
+            return media_list, Gtk.Label()
+
+        def build_mouse_page(self):
+            mouse_list = Gtk.ListBox()
+            mouse_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            mouse_list.connect("row-activated", self.on_mouse_activated)
+            for action, label in MOUSE_ACTIONS:
+                row = Gtk.ListBoxRow()
+                row.action = action
+                row.desc = label
+                row.set_child(Gtk.Label(label=label, xalign=0))
+                mouse_list.append(row)
+            self.pages["mouse"] = mouse_list
+            return mouse_list, Gtk.Label()
+
+        def build_led_page(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_margin_top(8)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            self.led_list = Gtk.ListBox()
+            self.led_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            self.led_list.connect("row-activated", self.on_led_activated)
+            for value, label in LED_MODES:
+                row = Gtk.ListBoxRow()
+                row.mode = value
+                row.desc = label
+                row.set_child(Gtk.Label(label=label, xalign=0))
+                self.led_list.append(row)
+            box.append(self.led_list)
+            self.pages["led"] = box
+            return box, Gtk.Label()
+
+        def build_osc_page(self):
+            outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            outer_box.set_margin_top(8)
+            outer_box.set_margin_start(8)
+            outer_box.set_margin_end(8)
+            host_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            host_row.append(Gtk.Label(label="Host:"))
+            self.osc_host = Gtk.Entry(text=self.settings.get("osc", {}).get("host", "127.0.0.1"))
+            self.osc_host.connect("changed", self.on_osc_host)
+            host_row.append(self.osc_host)
+            host_row.append(Gtk.Label(label="Port:"))
+            self.osc_port = Gtk.Entry(
+                text=str(self.settings.get("osc", {}).get("port", 9000)))
+            self.osc_port.connect("changed", self.on_osc_port)
+            host_row.append(self.osc_port)
+            outer_box.append(host_row)
+            outer_box.append(Gtk.Label(label=self.settings.get("osc", {}).get(
+                "user_volume_addr", "/avatar/parameters/UserVolume"), xalign=0))
+            self.osc_hint = Gtk.Label(xalign=0)
+            self.osc_hint.set_wrap(True)
+            outer_box.append(self.osc_hint)
+            scroll = Gtk.ScrolledWindow()
+            table = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.osc_rows = {}
+            for name, num in PHYS_KEYS:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                label = Gtk.Label(label=name)
+                label.set_size_request(56, -1)
+                row.append(label)
+                entry = Gtk.Entry(hexpand=True)
+                entry.set_text(self.settings.get("key_osc", {}).get(str(num), {}).get("addr", ""))
+                entry.connect("changed", self.on_osc_addr, num)
+                row.append(entry)
+                toggle = Gtk.ToggleButton(label="Tgl")
+                toggle.set_active(bool(self.settings.get("key_osc", {})
+                                       .get(str(num), {}).get("toggle", False)))
+                toggle.connect("toggled", self.on_osc_toggle, num)
+                row.append(toggle)
+                learn = Gtk.Button(label="...")
+                learn.set_tooltip_text("learn key code")
+                learn.connect("clicked", self.on_learn_key, num)
+                row.append(learn)
+                self.osc_rows[num] = (entry, toggle, learn)
+                table.append(row)
+            scroll.set_child(table)
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            outer_box.append(scroll)
+            self.pages["osc"] = outer_box
+            return outer_box, Gtk.Label()
+
+        def build_dial_page(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_margin_top(8)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            self.dial_hint = Gtk.Label(xalign=0)
+            self.dial_hint.set_wrap(True)
+            box.append(self.dial_hint)
+            dial_cfg = self.settings.get("dial", {})
+            active = dial_cfg.get("modes", ["mic", "headphone", "user"])
+            self.dial_checks = {}
+            for mode in DIAL_MODES:
+                check = Gtk.CheckButton(label=mode["ja"] + " / " + mode["en"])
+                check.set_active(mode["id"] in active)
+                check.connect("toggled", self.on_dial_mode, mode["id"])
+                self.dial_checks[mode["id"]] = check
+                box.append(check)
+            box.append(Gtk.Separator())
+            addr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            addr_row.append(Gtk.Label(label="User volume OSC:"))
+            self.user_vol_entry = Gtk.Entry(hexpand=True)
+            self.user_vol_entry.set_text(self.settings.get("osc", {}).get(
+                "user_volume_addr", "/avatar/parameters/UserVolume"))
+            self.user_vol_entry.connect("changed", self.on_user_vol_addr)
+            addr_row.append(self.user_vol_entry)
+            box.append(addr_row)
+            learn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.learn_rotate_btn = Gtk.Button()
+            self.learn_rotate_btn.connect("clicked", self.on_learn_rotate)
+            learn_row.append(self.learn_rotate_btn)
+            self.learn_push_btn = Gtk.Button()
+            self.learn_push_btn.connect("clicked", self.on_learn_push)
+            learn_row.append(self.learn_push_btn)
+            box.append(learn_row)
+            self.dial_state = Gtk.Label(xalign=0)
+            box.append(self.dial_state)
+            self.mon_btn = Gtk.Button()
+            self.mon_btn.connect("clicked", self.on_monitor_toggle)
+            box.append(self.mon_btn)
+            self.pages["dial"] = box
+            return box, Gtk.Label()
+
+        def build_about_page(self):
+            label = Gtk.Label(xalign=0, justify=Gtk.Justification.LEFT)
+            label.set_wrap(True)
+            label.set_margin_top(12)
+            label.set_margin_start(12)
+            self.about_label = label
+            self.pages["about"] = label
+            return label, Gtk.Label()
+
+        # -- helpers -------------------------------------------------------
+        def tr(self, key):
+            return I18N[self.lang].get(key, I18N["en"].get(key, key))
+
+        def on_toggle_lang(self, _btn):
+            self.lang = "en" if self.lang == "ja" else "ja"
+            self.settings["lang"] = self.lang
+            save_settings(self.settings)
+            self.apply_lang()
+
+        def apply_lang(self):
+            t = I18N[self.lang]
+            self.set_title(t["app"])
+            self.title_label.set_text(t["app"])
+            self.lang_btn.set_label("JA" if self.lang == "en" else "EN")
+            self.key_label.set_markup("<b>%s</b>" % t["selected"])
+            self.assign_label.set_markup("<b>%s</b>" % t["current"])
+            self.clear_btn.set_label(t["clear"])
+            self.dl_btn.set_label(t["download"])
+            self.disable_btn.set_label(t["disable_key"])
+            self.layer_label.set_text(t["layer"])
+            self.layer_dd.set_selected(self.layer - 1)
+            self.osc_hint.set_text(t["osc_hint"])
+            self.dial_hint.set_text(t["dial_hint"])
+            self.learn_rotate_btn.set_label(t["learn_rotate"])
+            self.learn_push_btn.set_label(t["learn_push"])
+            self.about_label.set_text(t["about_text"])
+            page_keys = ["page_key", "page_fun", "page_media", "page_mouse",
+                         "page_led", "page_osc", "page_dial", "page_about"]
+            for index, key in enumerate(page_keys):
+                child = self.notebook.get_nth_page(index)
+                self.notebook.set_tab_label(child, Gtk.Label(label=t[key]))
+            self.update_monitor_button()
+            self.update_conn_ui(self._last_conn)
+            self.refresh_assignment()
+
+        def update_conn_ui(self, connected):
+            self._last_conn = connected
+            if connected:
+                self.status_dot.add_css_class("success")
+                self.status_dot.remove_css_class("error")
+                text = self.tr("connected")
+                color = "green"
+            else:
+                self.status_dot.remove_css_class("success")
+                self.status_dot.add_css_class("error")
+                text = self.tr("disconnected")
+                color = "red"
+            self.status_txt.set_markup('<span foreground="%s">%s</span>' % (color, text))
+
+        def tick_connect(self):
+            if not self.dev.is_open():
+                try:
+                    ok = self.dev.connect()
+                except DeviceError as exc:
+                    ok = False
+                    self._last_error = self.dev.last_error
+                    if not self._tried_permission:
+                        self._tried_permission = True
+                        self.toast.set_text(str(exc))
+                except Exception as exc:
+                    ok = False
+                    if str(exc) != self._last_error:
+                        self._last_error = str(exc)
+                        self.toast.set_text(str(exc))
+                if ok:
+                    self._last_error = None
+                    if self.report_layer_needed():
+                        self.dev.switch_layer(self.layer)
+                elif self.dev.last_error and self.dev.last_error != self._last_error:
+                    self._last_error = self.dev.last_error
+                    self.toast.set_text(self.dev.last_error)
+                self.update_conn_ui(ok)
+            else:
+                self.update_conn_ui(True)
+            self.update_monitor_button()
+            return True
+
+        def report_layer_needed(self):
+            return self.dev.report_id != 0
+
+        def status(self, message):
+            self.toast.set_text(message)
+
+        def current_layer(self):
+            return self.layer
+
+        def on_layer_changed(self, dropdown, _pspec):
+            selected = dropdown.get_selected() + 1
+            if selected == self.layer:
+                return
+            self.layer = selected
+            self.settings["layer"] = selected
+            save_settings(self.settings)
+            if self.dev.is_open() and self.report_layer_needed():
+                self.dev.switch_layer(selected)
+            self.refresh_assignment()
+
+        def refresh_assignment(self):
+            layer_key = str(self.layer)
+            store = self.settings.get("assignments", {}).get(layer_key, {})
+            if self.selected_key is None:
+                self.assign_label.set_markup(
+                    "<b>%s</b>: %s" % (self.tr("current"), self.tr("no_key")))
+                return
+            value = store.get(str(self.selected_key))
+            name = dict(PHYS_KEYS).get(self.selected_key, str(self.selected_key))
+            self.assign_label.set_markup(
+                "<b>%s</b> [%s]: %s" % (self.tr("current"), name,
+                                        value or self.tr("assign_empty")))
+
+        def remember(self, description):
+            store = self.settings.setdefault("assignments", {}).setdefault(
+                str(self.layer), {})
+            if self.selected_key is not None:
+                store[str(self.selected_key)] = description
+            save_settings(self.settings)
+            self.refresh_assignment()
+
+        # -- key selection -------------------------------------------------
+        def on_pick_key(self, button, num):
+            self.selected_key = num
+            for widget in self.key_buttons.values():
+                widget.remove_css_class("destructive-action")
+            button.add_css_class("destructive-action")
+            self.refresh_assignment()
+
+        def on_clear(self, _btn):
+            self.selected_key = None
+            self.pending = None
+            self.toast.set_text("")
+            for widget in self.key_buttons.values():
+                widget.remove_css_class("destructive-action")
+            self.refresh_assignment()
+
+        def require_key(self):
+            if self.selected_key is None:
+                self.status(self.tr("pick_first"))
+                return False
+            if not self.dev.is_open():
+                self.status(self.tr("need_device"))
+                return False
+            return True
+
+        # -- pages handlers ------------------------------------------------
+        def on_basic_activated(self, _box, row):
+            if row is None:
+                return
+            self.pending = {"kind": "key", "desc": row.get_child().get_text(),
+                            "keys": [(0, row.usage)], "lone_mod": 0}
+            self.write_pending()
+
+        def on_media_activated(self, _box, row):
+            if row is None:
+                return
+            self.pending = {"kind": "media", "action": row.action, "desc": row.desc}
+            self.write_pending()
+
+        def on_mouse_activated(self, _box, row):
+            if row is None:
+                return
+            self.pending = {"kind": "mouse", "action": row.action, "desc": row.desc}
+            self.write_pending()
+
+        def on_led_activated(self, _box, row):
+            if row is None:
+                return
+            self.pending = {"kind": "led", "mode": row.mode, "desc": row.desc}
+            self.write_pending()
+
+        def on_add_group(self, _btn):
+            mods = 0
+            for mask, check in self.mod_checks.items():
+                if check.get_active():
+                    mods |= mask
+            index = self.base_dd.get_selected()
+            if index == 0:
+                self.groups = []
+            elif len(self.groups) < 5:
+                self.groups.append((mods, USAGE_KEYS[index - 1][1]))
+            self.render_groups()
+
+        def on_reset_groups(self, _btn):
+            self.groups = []
+            self.group_mod = 0
+            for check in self.mod_checks.values():
+                check.set_active(False)
+            self.base_dd.set_selected(0)
+            self.render_groups()
+
+        def render_groups(self):
+            while True:
+                child = self.groups_list.get_first_child()
+                if child is None:
+                    break
+                self.groups_list.remove(child)
+            if not self.groups:
+                row = Gtk.ListBoxRow()
+                row.set_child(Gtk.Label(label=self.tr("assign_empty"), xalign=0))
+                self.groups_list.append(row)
+                return
+            for mods, usage in self.groups:
+                row = Gtk.ListBoxRow()
+                row.set_child(Gtk.Label(label=self.describe(mods, usage), xalign=0))
+                self.groups_list.append(row)
+
+        @staticmethod
+        def describe(mods, usage):
+            names = [name for name, mask in MODIFIERS if mods & mask]
+            if usage:
+                for label, code in USAGE_KEYS:
+                    if code == usage:
+                        names.append(label)
+                        break
+            return "+".join(names) or "-"
+
+        def build_pending_from_groups(self):
+            mods = 0
+            for mask, check in self.mod_checks.items():
+                if check.get_active():
+                    mods |= mask
+            index = self.base_dd.get_selected()
+            if index == 0:
+                keys = []
+                lone = mods
+                desc = self.describe(mods, 0)
+            else:
+                keys = list(self.groups)
+                if not keys:
+                    keys = [(mods, USAGE_KEYS[index - 1][1])]
+                lone = keys[0][0]
+                desc = " / ".join(self.describe(gmod, gusage) for gmod, gusage in keys)
+            return {"kind": "key", "desc": desc, "keys": keys, "lone_mod": lone}
+
+        def on_download(self, _btn):
+            page = self.notebook.get_current_page()
+            if page == 0:
+                row = self.basic_list.get_selected_row()
+                if row is None:
+                    self.status(self.tr("pick_function"))
+                    return
+                self.pending = {"kind": "key", "desc": row.get_child().get_text(),
+                                "keys": [(0, row.usage)], "lone_mod": 0}
+            elif page == 1:
+                self.pending = self.build_pending_from_groups()
+            elif page == 2:
+                row = self.notebook.get_nth_page(2).get_selected_row()
+                if row is None:
+                    self.status(self.tr("pick_function"))
+                    return
+                self.pending = {"kind": "media", "action": row.action, "desc": row.desc}
+            elif page == 3:
+                row = self.notebook.get_nth_page(3).get_selected_row()
+                if row is None:
+                    self.status(self.tr("pick_function"))
+                    return
+                self.pending = {"kind": "mouse", "action": row.action, "desc": row.desc}
+            elif page == 4:
+                row = self.led_list.get_selected_row()
+                if row is None:
+                    self.status(self.tr("pick_function"))
+                    return
+                self.pending = {"kind": "led", "mode": row.mode, "desc": row.desc}
+            if self.pending is None:
+                self.status(self.tr("pick_function"))
+                return
+            self.write_pending()
+
+        def write_pending(self):
+            pending = self.pending
+            if pending is None:
+                self.status(self.tr("pick_function"))
+                return
+            if pending["kind"] == "led":
+                if not self.dev.is_open():
+                    self.status(self.tr("need_device"))
+                    return
+                ok = self.dev.write_led(self.current_layer(), pending["mode"])
+            else:
+                if not self.require_key():
+                    return
+                layer = self.current_layer()
+                if pending["kind"] == "key":
+                    ok = self.dev.write_key(self.selected_key, layer,
+                                            pending["keys"], pending.get("lone_mod", 0))
+                elif pending["kind"] == "media":
+                    ok = self.dev.write_media(self.selected_key, layer, pending["action"])
+                else:
+                    ok = self.dev.write_mouse(self.selected_key, layer, pending["action"])
+            if ok:
+                self.remember(pending["desc"])
+                self.status("%s (%s)" % (self.tr("download_ok"), pending["desc"]))
+            else:
+                self.status(self.tr("download_ng"))
+
+        def on_disable(self, _btn):
+            if not self.require_key():
+                return
+            ok = self.dev.write_key(self.selected_key, self.current_layer(), [], 0)
+            if ok:
+                self.remember(self.tr("assign_empty"))
+                self.status(self.tr("download_ok"))
+            else:
+                self.status(self.tr("download_ng"))
+
+        def on_help(self, _btn):
+            dialog = Adw.MessageDialog(transient_for=self, modal=True)
+            dialog.set_heading(self.tr("help_title"))
+            dialog.set_body(self.tr("help_text"))
+            dialog.add_response("ok", "OK")
+            dialog.present()
+
+        # -- OSC -----------------------------------------------------------
+        def on_osc_host(self, entry):
+            self.settings.setdefault("osc", {})["host"] = entry.get_text().strip()
+            save_settings(self.settings)
+
+        def on_osc_port(self, entry):
+            try:
+                self.settings.setdefault("osc", {})["port"] = int(entry.get_text().strip())
+                save_settings(self.settings)
+            except ValueError:
+                pass
+
+        def on_user_vol_addr(self, entry):
+            self.settings.setdefault("osc", {})["user_volume_addr"] = entry.get_text().strip()
+            save_settings(self.settings)
+
+        def on_osc_addr(self, entry, num):
+            cfg = self.settings.setdefault("key_osc", {}).setdefault(
+                str(num), {"addr": "", "toggle": False, "code": None})
+            cfg["addr"] = entry.get_text().strip()
+            save_settings(self.settings)
+
+        def on_osc_toggle(self, button, num):
+            cfg = self.settings.setdefault("key_osc", {}).setdefault(
+                str(num), {"addr": "", "toggle": False, "code": None})
+            cfg["toggle"] = button.get_active()
+            save_settings(self.settings)
+
+        def on_dial_mode(self, button, mode_id):
+            dial = self.settings.setdefault("dial", {})
+            current = set(dial.get("modes", ["mic", "headphone", "user"]))
+            if button.get_active():
+                current.add(mode_id)
+            else:
+                current.discard(mode_id)
+            dial["modes"] = [m["id"] for m in DIAL_MODES if m["id"] in current]
+            save_settings(self.settings)
+
+        # -- learning ------------------------------------------------------
+        def start_learn(self, label, seconds, callback, want_key=True, want_rel=False,
+                        ignore=()):
+            if self._learn is not None and not self._learn.done:
+                return
+            self.status(label)
+            thread = LearnThread(seconds, want_key=want_key, want_rel=want_rel,
+                                 ignore=ignore)
+            self._learn = thread
+            thread.start()
+            from gi.repository import GLib as _GLib
+
+            def poll():
+                if not thread.done:
+                    return True
+                if thread.result:
+                    callback(thread.result[0], thread.result[1])
+                else:
+                    self.status(self.tr("learn_fail"))
+                self._learn = None
+                return False
+            _GLib.timeout_add(200, poll)
+
+        def on_learn_key(self, _btn, num):
+            ignore = set()
+            for code_cfg in self.settings.get("key_osc", {}).values():
+                if code_cfg.get("code"):
+                    ignore.add(int(code_cfg["code"]))
+            push = self.settings.get("dial", {}).get("push_code")
+            if push:
+                ignore.add(int(push))
+
+            def done(_kind, code):
+                cfg = self.settings.setdefault("key_osc", {}).setdefault(
+                    str(num), {"addr": "", "toggle": False, "code": None})
+                cfg["code"] = code
+                save_settings(self.settings)
+                self.status("%s: %d" % (self.tr("learn_done"), code))
+            self.start_learn(self.tr("learning"), 5, done, ignore=ignore)
+
+        def on_learn_rotate(self, _btn):
+            def done(_kind, code):
+                self.settings.setdefault("dial", {})["rotate_codes"] = [code]
+                save_settings(self.settings)
+                self.refresh_dial_state()
+                self.status("%s: %d" % (self.tr("learn_done"), code))
+            self.start_learn(self.tr("learning"), 6, done, want_key=False, want_rel=True)
+
+        def on_learn_push(self, _btn):
+            ignore = set()
+            for code_cfg in self.settings.get("key_osc", {}).values():
+                if code_cfg.get("code"):
+                    ignore.add(int(code_cfg["code"]))
+
+            def done(_kind, code):
+                self.settings.setdefault("dial", {})["push_code"] = code
+                save_settings(self.settings)
+                self.refresh_dial_state()
+                self.status("%s: %d" % (self.tr("learn_done"), code))
+            self.start_learn(self.tr("learning"), 6, done, ignore=ignore)
+
+        def refresh_dial_state(self):
+            dial = self.settings.get("dial", {})
+            rotate = dial.get("rotate_codes") or list(DIAL_DEFAULT_CODES)
+            push = dial.get("push_code")
+            self.dial_state.set_text("rotate=%s  push=%s" % (rotate, push))
+
+        # -- monitor -------------------------------------------------------
+        def update_monitor_button(self):
+            running = monitor_is_running()
+            self.mon_btn.set_label(self.tr("stop_monitor") if running
+                                   else self.tr("start_monitor"))
+            for css in ("suggested-action", "destructive-action"):
+                self.mon_btn.remove_css_class(css)
+            self.mon_btn.add_css_class("destructive-action" if running
+                                       else "suggested-action")
+            if hasattr(self, "dial_state"):
+                self.refresh_dial_state()
+
+        def on_monitor_toggle(self, _btn):
+            if monitor_is_running():
+                stop_monitor_process()
+                self.status(self.tr("monitor_stopped"))
+            else:
+                ok, err = start_monitor_process()
+                self.status(self.tr("monitor_error") + (": " + err if err else "")
+                            if not ok else self.tr("monitor_running"))
+            self.update_monitor_button()
+
+    class Application(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.t1kb.config")
+
+        def do_activate(self):
+            window = MainWindow(self)
+            window.present()
+
+    app = Application()
+    return app.run(None)
+
+
+# ---------------------------------------------------------------------------
+# event watch (diagnostics)
+# ---------------------------------------------------------------------------
+
+INPUT_CODES = "/usr/include/linux/input-event-codes.h"
+
+
+def load_input_names():
+    names = {}
+    try:
+        lines = open(INPUT_CODES, encoding="utf-8", errors="replace")
+    except OSError:
+        return names
+    pattern = re.compile(r"^\s*#define\s+((?:KEY|BTN|REL|ABS)_[A-Z0-9_]+)\s+(\d+)")
+    with lines:
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                names.setdefault(int(match.group(2)), match.group(1))
+    return names
+
+
+def event_names(names, etype, code):
+    label = names.get(code)
+    if label is None:
+        label = "0x%03x" % code
+    kind = {EV_KEY: "KEY", EV_REL: "REL", 3: "ABS", 4: "MSC"}.get(
+        etype, "EV%d" % etype)
+    return kind, label
+
+
+def run_watch(seconds=None):
+    nodes = t1_input_nodes()
+    if not nodes:
+        print("no readable T1 input node - check the udev rule", file=sys.stderr)
+        return 1
+    fds = open_input_nodes()
+    if not fds:
+        print("cannot open %s" % ", ".join(path for _, path in nodes), file=sys.stderr)
+        return 1
+    names = load_input_names()
+    paths = dict(fds)
+    print("watching: %s" % ", ".join(os.path.basename(path) for _, path in fds))
+    print("press a key or turn the dial (Ctrl-C to stop)")
+    deadline = time.time() + seconds if seconds else None
+    try:
+        while deadline is None or time.time() < deadline:
+            try:
+                ready, _, _ = select.select([fd for fd, _ in fds], [], [], 0.5)
+            except (OSError, ValueError):
+                break
+            for fd in ready:
+                for etype, code, value in read_events(fd):
+                    if etype == EV_SYN:
+                        continue
+                    kind, label = event_names(names, etype, code)
+                    if etype == EV_KEY:
+                        state = "down" if value == 1 else ("up" if value == 0 else "repeat")
+                    else:
+                        state = "%+d" % value
+                    print("  %-9s %-4s %-18s %s" % (
+                        os.path.basename(paths[fd]), kind, label, state))
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    for fd, _ in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# self test
+# ---------------------------------------------------------------------------
+
+def selftest(write=False, verbose=True):
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append((name, ok, detail))
+        if verbose:
+            print("%-28s %s%s" % (name, "OK  " if ok else "FAIL",
+                                  (" - " + detail) if detail else ""))
+
+    rule_ok = os.path.exists(UDEV_RULE)
+    check("udev rule installed", rule_ok, UDEV_RULE if rule_ok else
+          "run: sudo ./install.sh")
+
+    node = usb_node_path()
+    check("usb device present", node is not None, node or "1189:8890 not found")
+
+    device = T1Device()
+    if node:
+        try:
+            opened = os.open(node, os.O_RDWR)
+            os.close(opened)
+            check("usb node permission", True, node)
+        except OSError as exc:
+            check("usb node permission", False, str(exc))
+
+    connected = False
+    if node:
+        try:
+            connected = device.connect()
+            detail = ""
+            if not connected:
+                detail = device.last_error or ""
+            check("config interface (usbfs)", connected, detail)
+        except DeviceError as exc:
+            check("config interface (usbfs)", False, str(exc).splitlines()[0])
+
+    if connected:
+        check("report id detected", True,
+              "id=%d data=%d bytes frame=%d" % (
+                  device.report_id, device.data_len,
+                  1 + device.data_len if device.had_report_id else device.data_len))
+        check("write path", True, "urb_type=%s" %
+              ("interrupt" if device._urb_type == USBDEVFS_URB_TYPE_INTERRUPT else
+               "bulk" if device._urb_type == USBDEVFS_URB_TYPE_BULK else "control"))
+        if write:
+            ok = device.switch_layer(1) and device.write_payload(flash_report())
+            check("test write (layer+flash)", ok, "" if ok else "failed")
+
+    hidraw = sorted(glob.glob("/dev/hidraw*"))
+    readable = []
+    for path in hidraw:
+        try:
+            handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            os.close(handle)
+            readable.append(os.path.basename(path))
+        except OSError:
+            pass
+    check("hidraw readable", bool(hidraw) and len(readable) == len(hidraw),
+          "%d/%d" % (len(readable), len(hidraw)))
+
+    nodes = t1_input_nodes()
+    ev_readable = []
+    for path, _name in nodes:
+        try:
+            handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            os.close(handle)
+            ev_readable.append(os.path.basename(path))
+        except OSError:
+            pass
+    check("input events readable", bool(nodes) and len(ev_readable) == len(nodes),
+          "%d/%d of %s" % (len(ev_readable), len(nodes),
+                           ",".join(os.path.basename(p) for p, _ in nodes)))
+
+    device.close()
+    passed = all(ok for _, ok, _ in results)
+    if verbose:
+        print("\nRESULT: %s" % ("PASS" if passed else "FAIL"))
+    return 0 if passed else 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="T1 mini keyboard configuration tool for Linux")
+    parser.add_argument("--version", action="version", version="%s %s" % (APP_NAME, VERSION))
+    parser.add_argument("--monitor", action="store_true",
+                        help="run the dial/OSC monitor daemon in the foreground")
+    parser.add_argument("--selftest", action="store_true",
+                        help="check device access and the write path")
+    parser.add_argument("--write", action="store_true",
+                        help="with --selftest: perform a harmless test write")
+    parser.add_argument("--watch", nargs="?", const=0, type=int, default=None,
+                        metavar="SECONDS",
+                        help="print T1 input events (0 or omitted = until Ctrl-C)")
+    parser.add_argument("--gui", action="store_true", help="start the GUI (default)")
+    args = parser.parse_args(argv)
+
+    if args.monitor:
+        try:
+            run_monitor()
+        except KeyboardInterrupt:
+            return 0
+        return 0
+    if args.watch is not None:
+        return run_watch(args.watch or None)
+    if args.selftest:
+        return selftest(write=args.write)
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

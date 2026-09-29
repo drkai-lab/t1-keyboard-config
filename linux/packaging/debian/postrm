@@ -1,0 +1,12 @@
+#!/bin/sh
+# The rule file is already gone at this point - make the kernel drop it.
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    for subsystem in usb hidraw input; do
+        udevadm trigger --subsystem-match="$subsystem" || true
+    done
+fi
+
+exit 0

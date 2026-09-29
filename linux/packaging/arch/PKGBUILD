@@ -1,0 +1,42 @@
+# Maintainer: T1 Keyboard Config contributors
+# Build with ./build-packages.sh (it stages payload/ and tests/ next to this file).
+pkgname=t1-keyboard-config
+pkgver="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$startdir/../../t1-keyboard-config")"
+pkgrel=1
+pkgdesc="T1 mini keyboard configurator (USB VID 1189 / PID 8890)"
+arch=('x86_64')
+url=""  # repository URL, if you publish one
+license=('MIT')
+depends=('python' 'python-gobject' 'libadwaita')
+optdepends=('pipewire-utils: wpctl volume control for the dial')
+source=()
+sha256sums=()
+
+build() {
+  :
+}
+
+check() {
+  local tmp
+  tmp="$(mktemp -d)"
+  install -Dm755 "$startdir/payload/usr/bin/t1-keyboard-config" \
+    "$tmp/t1-keyboard-config"
+  cp -a "$startdir/tests" "$tmp/tests"
+  python3 "$tmp/tests/test_protocol.py"
+  python3 "$tmp/tests/test_monitor.py"
+  rm -rf "$tmp"
+}
+
+package() {
+  local p="$startdir/payload"
+  install -Dm755 "$p/usr/bin/t1-keyboard-config" \
+    "$pkgdir/usr/bin/t1-keyboard-config"
+  install -Dm644 "$p/usr/lib/udev/rules.d/99-t1-keyboard.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/99-t1-keyboard.rules"
+  install -Dm644 "$p/usr/share/applications/t1-keyboard-config.desktop" \
+    "$pkgdir/usr/share/applications/t1-keyboard-config.desktop"
+  install -Dm644 "$p/usr/share/doc/t1-keyboard-config/README.md" \
+    "$pkgdir/usr/share/doc/t1-keyboard-config/README.md"
+  install -Dm644 "$p/usr/share/licenses/t1-keyboard-config/LICENSE" \
+    "$pkgdir/usr/share/licenses/t1-keyboard-config/LICENSE"
+}
