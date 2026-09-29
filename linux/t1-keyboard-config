@@ -756,6 +756,13 @@ def _mac():
     iohid.IOHIDElementGetType.restype = cfl
     iohid.IOHIDElementGetReportSize.argtypes = [cfp]
     iohid.IOHIDElementGetReportSize.restype = cfl
+    cf.CFRunLoopGetCurrent.argtypes = []
+    cf.CFRunLoopGetCurrent.restype = cfp
+    cf.CFRunLoopRunInMode.argtypes = [cfp, ctypes.c_double, ctypes.c_int]
+    cf.CFRunLoopRunInMode.restype = cfl
+    iohid.IOHIDManagerScheduleWithRunLoop.argtypes = [cfp, cfp, cfp]
+    iohid.IOHIDManagerRegisterInputValueCallback.argtypes = [cfp, cfp, cfp]
+    iohid.IOHIDManagerOpen.restype = cfl
 
     _MAC_LIBS.update({"cf": cf, "iohid": iohid})
     return _MAC_LIBS
@@ -1559,12 +1566,21 @@ class MacInputSource(QueueInputSource):
         iohid.IOHIDManagerRegisterInputValueCallback(manager, self._callback, None)
         iohid.IOHIDManagerOpen(manager, 0)
         run_loop = cf.CFRunLoopGetCurrent()
-        mode = cf.CFStringCreateWithCString(
-            None, b"kCFRunLoopDefaultMode", 0x08000100)
+        mode = None
+        release_mode = True
+        try:
+            mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode").value
+            release_mode = False  # global constant, not ours to release
+        except (ValueError, TypeError):
+            mode = None
+        if not mode:
+            mode = cf.CFStringCreateWithCString(
+                None, b"kCFRunLoopDefaultMode", 0x08000100)
         iohid.IOHIDManagerScheduleWithRunLoop(manager, run_loop, mode)
         while not self._stop.is_set():
             cf.CFRunLoopRunInMode(mode, 0.25, 0)
-        _cf_release(mode)
+        if release_mode:
+            _cf_release(mode)
 
     def _on_input(self, _context, _result, _sender, _value):
         try:

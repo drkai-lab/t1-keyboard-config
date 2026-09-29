@@ -64,9 +64,9 @@ jobs:
           python3 tests/test_protocol.py
           python3 tests/test_platform.py
       - name: Build console exe
-        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config --distpath ../dist-win linux/t1-keyboard-config
+        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config --distpath ../dist-win t1-keyboard-config
       - name: Build windowed (GUI) exe
-        run: pyinstaller --noconfirm --onefile --windowed --name t1-keyboard-config-gui --distpath ../dist-win linux/t1-keyboard-config
+        run: pyinstaller --noconfirm --onefile --windowed --name t1-keyboard-config-gui --distpath ../dist-win t1-keyboard-config
       - name: Launch smoke test
         run: |
           ../dist-win/t1-keyboard-config.exe --version
@@ -105,9 +105,9 @@ jobs:
           python3 tests/test_protocol.py
           python3 tests/test_platform.py
       - name: Build the .app bundle
-        run: pyinstaller --noconfirm --onedir --windowed --name "T1 Keyboard Config" --distpath ../dist-mac linux/t1-keyboard-config
+        run: pyinstaller --noconfirm --onedir --windowed --name "T1 Keyboard Config" --distpath ../dist-mac t1-keyboard-config
       - name: Build the CLI binary
-        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config-cli --distpath ../dist-mac linux/t1-keyboard-config
+        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config-cli --distpath ../dist-mac t1-keyboard-config
       - name: Launch smoke test
         run: |
           ../dist-mac/t1-keyboard-config-cli --version
