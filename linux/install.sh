@@ -38,6 +38,8 @@ fail() { printf '  \033[31mNG\033[0m  %s\n' "$1" >&2; }
 echo "T1 Keyboard Config ${APP_NAME} installer"
 echo "----------------------------------------"
 
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
+
 # --- dependencies ----------------------------------------------------------
 if ! command -v python3 >/dev/null 2>&1; then
   fail "python3 not found"
@@ -45,20 +47,22 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 info "python3 $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
 
-if python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("Adw","1")' \
-     >/dev/null 2>&1; then
-  info "GTK4 + libadwaita bindings"
+if python3 -c 'import tkinter' >/dev/null 2>&1; then
+  info "tkinter (GUI, $(python3 -c 'import tkinter; print("Tk %s" % tkinter.TkVersion)'))"
 else
-  fail "PyGObject GTK4/libadwaita missing"
-  echo "       Arch:  sudo pacman -S python-gobject libadwaita"
-  echo "       Debian: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"
+  fail "tkinter missing (required for the GUI)"
+  echo "       Arch:    sudo pacman -S tk"
+  echo "       Debian:  sudo apt install python3-tk"
+  echo "       macOS:   brew install python-tk"
   exit 1
 fi
 
-if command -v wpctl >/dev/null 2>&1; then
-  info "wpctl (PipeWire volume control)"
-else
-  warn "wpctl not found - dial volume control disabled (pipewire-utils)"
+if [[ "${OS_NAME}" == "Linux" ]]; then
+  if command -v wpctl >/dev/null 2>&1; then
+    info "wpctl (PipeWire volume control)"
+  else
+    warn "wpctl not found - dial volume control disabled (pipewire-utils)"
+  fi
 fi
 
 # --- binary ----------------------------------------------------------------
@@ -67,6 +71,9 @@ install -m 0755 "${SRC_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}"
 info "installed ${BIN_DIR}/${APP_NAME}"
 
 # --- desktop entry ---------------------------------------------------------
+if [[ "${OS_NAME}" == "Darwin" ]]; then
+  echo "  ..  desktop entry skipped (macOS uses the terminal / Finder)"
+else
 mkdir -p "${APP_DIR}"
 cat > "${APP_DIR}/${APP_NAME}.desktop" <<EOF
 [Desktop Entry]
@@ -82,9 +89,12 @@ EOF
 command -v update-desktop-database >/dev/null 2>&1 && \
   update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
 info "installed ${APP_DIR}/${APP_NAME}.desktop"
+fi
 
 # --- optional monitor autostart -------------------------------------------
-if [[ ${ADD_AUTOSTART} -eq 1 ]]; then
+if [[ "${OS_NAME}" == "Darwin" ]]; then
+  echo "  ..  autostart on macOS: add a LaunchAgent (see README)"
+elif [[ ${ADD_AUTOSTART} -eq 1 ]]; then
   mkdir -p "${AUTOSTART_DIR}"
   cat > "${AUTOSTART_DIR}/${APP_NAME}-monitor.desktop" <<EOF
 [Desktop Entry]
@@ -99,7 +109,9 @@ else
 fi
 
 # --- udev rule -------------------------------------------------------------
-if [[ ${SKIP_UDEV} -eq 0 ]]; then
+if [[ "${OS_NAME}" != "Linux" ]]; then
+  echo "  ..  udev not used on ${OS_NAME}"
+elif [[ ${SKIP_UDEV} -eq 0 ]]; then
   if [[ -f "${UDEV_RULE_SRC}" ]]; then
     if command -v sudo >/dev/null 2>&1; then
       if sudo -n cp "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}" 2>/dev/null || \

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""T1 MINI Keyboard configuration tool for Linux (Arch / Omarchy).
+"""T1 MINI Keyboard configuration tool (Linux / Windows / macOS).
 
 Native re-implementation of the Windows "MINI KeyBoard.exe" (HIDTester)
 configuration utility. Protocol reverse-engineered from the decompiled
 original: VID=0x1189 PID=0x8890, config interface mi_01 (interface 1,
 interrupt-OUT endpoint 0x02, no kernel driver bound).
 
-Device write path uses usbfs (SUBMITURB) with a control-transfer fallback.
+Device write path per platform:
+  Linux    usbfs (SUBMITURB) with a control-transfer fallback
+  Windows  HID WriteFile on the mi_01 device
+  macOS    IOHIDDeviceSetReport on the mi_01 service
+
+Input events are read through the platform input backend and normalised to
+Linux evdev codes, so settings files stay portable between the three OSes.
 Run "t1-keyboard-config --selftest" to validate the install.
 """
 
@@ -16,12 +22,14 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
-import fcntl
 import glob
 import json
 import os
+import platform
+import queue
 import re
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -29,13 +37,34 @@ import sys
 import threading
 import time
 
-VERSION = "1.0.0"
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+IS_LINUX = sys.platform.startswith("linux")
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+VERSION = "1.1.0"
 APP_NAME = "t1-keyboard-config"
 VID, PID = 0x1189, 0x8890
-CONFIG_DIR = os.path.expanduser("~/.config/t1-keyboard")
+
+if IS_WIN:
+    _root = os.environ.get("APPDATA") or os.path.expanduser("~")
+    CONFIG_DIR = os.path.join(_root, "t1-keyboard")
+    STATE_DIR = os.path.join(_root, "t1-keyboard", "state")
+elif IS_MAC:
+    _root = os.path.expanduser("~/Library/Application Support")
+    CONFIG_DIR = os.path.join(_root, "t1-keyboard")
+    STATE_DIR = os.path.join(_root, "t1-keyboard", "state")
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/t1-keyboard")
+    STATE_DIR = os.path.expanduser("~/.local/state/t1-keyboard")
+
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
-STATE_DIR = os.path.expanduser("~/.local/state/t1-keyboard")
 LOG_FILE = os.path.join(STATE_DIR, "monitor.log")
+PID_FILE = os.path.join(STATE_DIR, "monitor.pid")
 UDEV_RULE = "/etc/udev/rules.d/99-t1-keyboard.rules"
 CONFIG_INTERFACE = 1
 CONFIG_ENDPOINT = 0x02
@@ -143,8 +172,39 @@ def probe_report():
 
 
 # ---------------------------------------------------------------------------
-# usbfs transport
+# Transport interface and platform backends
 # ---------------------------------------------------------------------------
+
+
+class DeviceError(RuntimeError):
+    pass
+
+
+class BaseTransport:
+    """Sends framed reports to the T1 config interface.
+
+    open() claims the interface and returns
+    (report_id, data_len, had_report_id); report_id may be None when the
+    descriptor could not be read. It returns None on hard failures and sets
+    last_error, or raises DeviceError when the caller must fix permissions.
+    """
+
+    kind = "none"
+    last_error = None
+    node = None
+
+    def open(self):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+    def is_open(self):
+        return False
+
+    def send_frame(self, frame, report_id=0, has_report_id=True):
+        raise NotImplementedError
+
 
 def _IOC(dir_, type_, nr, size):
     return (dir_ << 30) | (ord(type_) << 8) | nr | (size << 16)
@@ -161,7 +221,6 @@ USBDEVFS_URB_TYPE_INTERRUPT = 1
 USBDEVFS_URB_TYPE_BULK = 3
 
 URB_TYPE_ORDER = (USBDEVFS_URB_TYPE_INTERRUPT, USBDEVFS_URB_TYPE_BULK)
-
 
 class _Urb(ctypes.Structure):
     _fields_ = [
@@ -219,24 +278,16 @@ def usb_node_path():
     return "/dev/bus/usb/%03d/%03d" % (bus, dev)
 
 
-class DeviceError(RuntimeError):
-    pass
+class LinuxUsbfsTransport(BaseTransport):
+    """usbfs (SUBMITURB) writer for the T1 config interface."""
 
-
-class T1Device:
-    """Writer for the T1 config interface (usbfs interrupt-OUT / control)."""
-
-    DEFAULT_DATA_LEN = 64
+    kind = "usbfs"
 
     def __init__(self):
         self.fd = None
-        self.report_id = 3
-        self.data_len = self.DEFAULT_DATA_LEN
-        self.had_report_id = True
-        self.node = None
-        self.last_error = None
         self._urb_type = None
-        self._fail_count = 0
+        self.last_error = None
+        self.node = None
 
     def is_open(self):
         return self.fd is not None
@@ -255,12 +306,12 @@ class T1Device:
         self.fd = None
         self.node = None
 
-    def connect(self):
+    def open(self):
         self.close()
         found = find_usb_node()
         if not found:
             self.last_error = "device-not-found"
-            return False
+            return None
         bus, dev, _ = found
         path = "/dev/bus/usb/%03d/%03d" % (bus, dev)
         try:
@@ -276,7 +327,7 @@ class T1Device:
                 "&& unplug/replug the keyboard)" % path)
         except OSError as exc:
             self.last_error = str(exc)
-            return False
+            return None
         self.node = path
         try:
             fcntl.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, ctypes.c_uint(CONFIG_INTERFACE))
@@ -287,26 +338,13 @@ class T1Device:
                                    "t1-keyboard-config window/monitor is using it")
             else:
                 self.last_error = "claim-failed: %s" % exc
-            return False
-
+            return None
         try:
             rid, data_len, had_id = self.read_report_descriptor()
         except Exception:
             rid, data_len, had_id = None, None, None
-        if rid is not None:
-            self.report_id, self.data_len, self.had_report_id = rid, data_len, had_id
-        else:
-            self.report_id, self.had_report_id = 3, True
-            self.data_len = self.DEFAULT_DATA_LEN
-        if not self.had_report_id:
-            self.report_id = 0
-        if not self.probe():
-            self.close()
-            self.last_error = "probe-failed"
-            return False
-        return True
+        return rid, data_len, had_id
 
-    # -- descriptor ---------------------------------------------------------
     def control_in(self, request_type, request, wvalue, windex, length, timeout=1000):
         buf = ctypes.create_string_buffer(length)
         ctrl = _Ctrl(request_type, request, wvalue, windex, length, timeout,
@@ -364,26 +402,12 @@ class T1Device:
         data_bytes = max(1, (bits + 7) // 8)
         return rid, data_bytes, rid != 0
 
-    # -- framing ------------------------------------------------------------
-    def frame(self, payload):
-        if self.had_report_id:
-            total = 1 + self.data_len
-            buf = bytearray(total)
-            buf[0] = self.report_id & 0xFF
-            body = bytes(payload)[:self.data_len]
-            buf[1:1 + len(body)] = body
-        else:
-            buf = bytearray(self.data_len)
-            body = bytes(payload)[:self.data_len]
-            buf[:len(body)] = body
-        return bytes(buf)
-
-    def _send_frame(self, frame):
+    def send_frame(self, frame, report_id=0, has_report_id=True):
         for urb_type in self._urb_order():
             if self._send_urb(frame, urb_type):
                 self._urb_type = urb_type
                 return True
-        return self._send_control(frame)
+        return self._send_control(frame, report_id, has_report_id)
 
     def _urb_order(self):
         if self._urb_type in URB_TYPE_ORDER:
@@ -417,20 +441,551 @@ class T1Device:
             pass
         return False
 
-    def _send_control(self, frame):
+    def _send_control(self, frame, report_id=0, has_report_id=True):
         try:
-            wvalue = (0x02 << 8) | (self.report_id if self.had_report_id else 0)
+            wvalue = (0x02 << 8) | (report_id if has_report_id else 0)
             buf = ctypes.create_string_buffer(bytes(frame), len(frame))
             ctrl = _Ctrl(0x21, 0x09, wvalue, CONFIG_INTERFACE, len(frame), 1000,
                          ctypes.cast(buf, ctypes.c_void_p))
             return fcntl.ioctl(self.fd, USBDEVFS_CONTROL, ctrl) >= 0
         except OSError:
             return False
+# --- Windows: HID output report -------------------------------------------
+
+IOCTL_HID_GET_REPORT_DESCRIPTOR = 0x000B040F
+DIGCF_PRESENT = 0x00000002
+DIGCF_DEVICEINTERFACE = 0x00000010
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+OPEN_EXISTING = 3
+ERROR_ACCESS_DENIED = 5
+
+_WIN_DLLS = {}
+
+
+def _win():
+    """Load kernel32/setupapi/hid and declare prototypes (Windows only)."""
+    if _WIN_DLLS:
+        return _WIN_DLLS
+    import ctypes.wintypes as wt
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_uint32),
+            ("InterfaceClassGuid", GUID),
+            ("Flags", ctypes.c_uint32),
+            ("Reserved", ctypes.c_uint32),
+        ]
+
+    class SP_DEVICE_INTERFACE_DETAIL_DATA_W(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_uint32),
+            ("DevicePath", ctypes.c_wchar * 1),
+        ]
+
+    class HIDP_CAPS(ctypes.Structure):
+        _fields_ = [
+            ("Usage", ctypes.c_uint16),
+            ("UsagePage", ctypes.c_uint16),
+            ("InputReportByteLength", ctypes.c_uint16),
+            ("OutputReportByteLength", ctypes.c_uint16),
+            ("FeatureReportByteLength", ctypes.c_uint16),
+            ("Reserved", ctypes.c_uint16 * 17),
+            ("NumberLinkCollectionNodes", ctypes.c_uint16),
+            ("NumberInputButtonCaps", ctypes.c_uint16),
+            ("NumberInputValueCaps", ctypes.c_uint16),
+            ("NumberInputDataIndices", ctypes.c_uint16),
+            ("NumberOutputButtonCaps", ctypes.c_uint16),
+            ("NumberOutputValueCaps", ctypes.c_uint16),
+            ("NumberOutputDataIndices", ctypes.c_uint16),
+            ("NumberFeatureButtonCaps", ctypes.c_uint16),
+            ("NumberFeatureValueCaps", ctypes.c_uint16),
+            ("NumberFeatureDataIndices", ctypes.c_uint16),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    hid = ctypes.WinDLL("hid.dll", use_last_error=True)
+
+    k32.CreateFileW.restype = wt.HANDLE
+    k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID,
+                                wt.DWORD, wt.DWORD, wt.HANDLE]
+    k32.WriteFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+                              ctypes.POINTER(wt.DWORD), wt.LPVOID]
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    k32.DeviceIoControl.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p,
+                                    wt.DWORD, ctypes.c_void_p, wt.DWORD,
+                                    ctypes.POINTER(wt.DWORD), wt.LPVOID]
+
+    setupapi.HidD_GetHidGuid.argtypes = [ctypes.c_void_p]
+    setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, wt.LPCWSTR,
+                                              wt.LPCWSTR, wt.DWORD]
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
+        ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+        ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+    hid.HidD_GetPreparsedData.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+    hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
+
+    _WIN_DLLS.update({
+        "k32": k32, "setupapi": setupapi, "hid": hid, "wt": wt,
+        "GUID": GUID, "SP_DEVICE_INTERFACE_DATA": SP_DEVICE_INTERFACE_DATA,
+        "SP_DEVICE_INTERFACE_DETAIL_DATA_W": SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+        "HIDP_CAPS": HIDP_CAPS,
+    })
+    return _WIN_DLLS
+
+
+def win_find_device_path():
+    """Path of the mi_01 (config) interface of the T1, or None."""
+    libs = _win()
+    wt, GUID = libs["wt"], libs["GUID"]
+    setupapi = libs["setupapi"]
+    guid = GUID()
+    setupapi.HidD_GetHidGuid(ctypes.byref(guid))
+    hdev = setupapi.SetupDiGetClassDevsW(
+        ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+    if hdev in (None, INVALID_HANDLE_VALUE, 0):
+        return None
+    iface = libs["SP_DEVICE_INTERFACE_DATA"]()
+    iface.cbSize = ctypes.sizeof(iface)
+    detail_type = libs["SP_DEVICE_INTERFACE_DETAIL_DATA_W"]
+    path = None
+    try:
+        for index in range(64):
+            if not setupapi.SetupDiEnumDeviceInterfaces(
+                    hdev, None, ctypes.byref(guid), index, ctypes.byref(iface)):
+                break
+            required = wt.DWORD(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(
+                hdev, ctypes.byref(iface), None, 0, ctypes.byref(required), None)
+            if not required.value:
+                continue
+            buf = ctypes.create_string_buffer(required.value)
+            ctypes.cast(buf, ctypes.POINTER(detail_type)).contents.cbSize = (
+                ctypes.sizeof(detail_type))
+            if not setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    hdev, ctypes.byref(iface), buf, required.value,
+                    ctypes.byref(required), None):
+                continue
+            text = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            low = text.lower()
+            if "vid_1189" in low and "pid_8890" in low and "mi_01" in low:
+                path = text
+                break
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(hdev)
+    return path
+
+
+class WindowsHidTransport(BaseTransport):
+    """HID output report writer for the T1 config interface (Windows)."""
+
+    kind = "hid"
+
+    def __init__(self):
+        self._handle = None
+        self._out_len = 65
+        self.last_error = None
+        self.node = None
+
+    def is_open(self):
+        return self._handle is not None
+
+    def close(self):
+        if self._handle is not None:
+            try:
+                _win()["k32"].CloseHandle(self._handle)
+            except Exception:
+                pass
+        self._handle = None
+        self.node = None
+
+    def open(self):
+        self.close()
+        try:
+            path = win_find_device_path()
+        except Exception as exc:
+            self.last_error = "enum-failed: %s" % exc
+            return None
+        if not path:
+            self.last_error = "device-not-found"
+            return None
+        libs = _win()
+        wt, k32 = libs["wt"], libs["k32"]
+        handle = k32.CreateFileW(
+            path, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
+        if handle in (None, INVALID_HANDLE_VALUE, 0):
+            error = ctypes.get_last_error()
+            if error == ERROR_ACCESS_DENIED:
+                self.last_error = "permission: close other programs using the T1"
+            else:
+                self.last_error = "open-failed: error %d" % error
+            return None
+        self._handle = handle
+        self.node = path
+        self._out_len = self._output_report_length() or 65
+        rid, data_len, had_id = self._read_report_descriptor()
+        if rid is None:
+            return None, None, None
+        return rid, data_len, had_id
+
+    def _output_report_length(self):
+        libs = _win()
+        preparsed = ctypes.c_void_p()
+        caps = libs["HIDP_CAPS"]()
+        hid = libs["hid"]
+        if not hid.HidD_GetPreparsedData(self._handle, ctypes.byref(preparsed)):
+            return 0
+        try:
+            if not hid.HidP_GetCaps(preparsed, ctypes.byref(caps)):
+                return 0
+            return int(caps.OutputReportByteLength)
+        finally:
+            hid.HidD_FreePreparsedData(preparsed)
+
+    def _read_report_descriptor(self):
+        """Report id / output length from IOCTL_HID_GET_REPORT_DESCRIPTOR."""
+        try:
+            libs = _win()
+            buf = ctypes.create_string_buffer(2048)
+            returned = libs["wt"].DWORD(0)
+            if not libs["k32"].DeviceIoControl(
+                    self._handle, IOCTL_HID_GET_REPORT_DESCRIPTOR, None, 0,
+                    buf, len(buf), ctypes.byref(returned), None):
+                return None, None, None
+            parsed = parse_report_descriptor(buf.raw[:returned.value])
+            if not parsed:
+                return None, None, None
+            outputs = parsed["outputs"]
+            if len(outputs) == 1:
+                rid, bits = next(iter(outputs.items()))
+            else:
+                non_zero = [r for r in outputs if r != 0]
+                rid = non_zero[0] if non_zero else 0
+                bits = outputs[rid]
+            return rid, max(1, (bits + 7) // 8), rid != 0
+        except Exception:
+            return None, None, None
+
+    def send_frame(self, frame, report_id=0, has_report_id=True):
+        if self._handle is None:
+            return False
+        data = bytearray(frame)
+        if has_report_id and not data:
+            return False
+        if len(data) < self._out_len:
+            data.extend(b"\x00" * (self._out_len - len(data)))
+        elif len(data) > self._out_len:
+            data = data[:self._out_len]
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(bytes(data))
+        written = _win()["wt"].DWORD(0)
+        try:
+            ok = _win()["k32"].WriteFile(self._handle, buf, len(data),
+                                         ctypes.byref(written), None)
+        except Exception:
+            return False
+        return bool(ok)
+
+
+# --- macOS: IOHIDDeviceSetReport ------------------------------------------
+
+_MAC_LIBS = {}
+
+
+def _mac():
+    """Load IOKit / CoreFoundation and declare prototypes (macOS only)."""
+    if _MAC_LIBS:
+        return _MAC_LIBS
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    iohid = ctypes.CDLL(
+        "/System/Library/Frameworks/IOKit.framework/IOKit")
+
+    cfp, cfl, cfbl = ctypes.c_void_p, ctypes.c_long, ctypes.c_long
+    cf.CFRelease.argtypes = [cfp]
+    cf.CFStringCreateWithCString.restype = cfp
+    cf.CFStringCreateWithCString.argtypes = [cfp, ctypes.c_char_p, cfl]
+    cf.CFDictionaryCreate.restype = cfp
+    cf.CFDictionaryCreate.argtypes = [
+        cfp, ctypes.POINTER(cfp), ctypes.POINTER(cfp), cfl, cfp, cfp]
+    cf.CFSetGetValues.argtypes = [cfp, ctypes.POINTER(cfp)]
+    cf.CFSetGetCount.argtypes = [cfp]
+    cf.CFSetGetCount.restype = cfl
+    iohid.IOHIDManagerCreate.restype = cfp
+    iohid.IOHIDManagerCreate.argtypes = [cfp, cfl]
+    iohid.IOHIDManagerSetDeviceMatching.argtypes = [cfp, cfp]
+    iohid.IOHIDManagerOpen.argtypes = [cfp, cfl]
+    iohid.IOHIDManagerCopyDevices.restype = cfp
+    iohid.IOHIDManagerCopyDevices.argtypes = [cfp]
+    iohid.IOHIDDeviceOpen.argtypes = [cfp, cfl]
+    iohid.IOHIDDeviceSetReport.argtypes = [
+        cfp, cfl, cfl, ctypes.c_void_p, cfl]
+    iohid.IOHIDDeviceSetReport.restype = cfl
+    iohid.IOHIDDeviceCopyMatchingElements.restype = cfp
+    iohid.IOHIDDeviceCopyMatchingElements.argtypes = [cfp, cfp, cfl]
+    iohid.IOHIDElementGetReportID.argtypes = [cfp]
+    iohid.IOHIDElementGetReportID.restype = cfl
+    iohid.IOHIDElementGetType.argtypes = [cfp]
+    iohid.IOHIDElementGetType.restype = cfl
+    iohid.IOHIDElementGetReportSize.argtypes = [cfp]
+    iohid.IOHIDElementGetReportSize.restype = cfl
+
+    _MAC_LIBS.update({"cf": cf, "iohid": iohid})
+    return _MAC_LIBS
+
+
+def _cf_string(text):
+    libs = _mac()
+    return libs["cf"].CFStringCreateWithCString(
+        None, text.encode("utf-8"), 0x08000100)
+
+
+def _cf_dict(pairs):
+    """Small CFDictionary with CFType callbacks (resolved from the library)."""
+    libs = _mac()
+    cf = libs["cf"]
+    keys = (ctypes.c_void_p * len(pairs))()
+    values = (ctypes.c_void_p * len(pairs))()
+    for index, (key, value) in enumerate(pairs):
+        keys[index] = _cf_string(key)
+        values[index] = _cf_string(value)
+    key_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+    val_cb = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+    return cf.CFDictionaryCreate(
+        None, keys, values, len(pairs),
+        ctypes.addressof(key_cb), ctypes.addressof(val_cb))
+
+
+def _cf_release(ref):
+    if ref:
+        try:
+            _mac()["cf"].CFRelease(ref)
+        except Exception:
+            pass
+
+
+def mac_find_device():
+    """(device_ref, report_id) for the T1 config interface, or (None, None)."""
+    libs = _mac()
+    iohid = libs["iohid"]
+    manager = iohid.IOHIDManagerCreate(None, 0)
+    if not manager:
+        return None, None
+    match = _cf_dict([("VendorID", "%d" % VID), ("ProductID", "%d" % PID)])
+    try:
+        iohid.IOHIDManagerSetDeviceMatching(manager, match)
+        iohid.IOHIDManagerOpen(manager, 0)
+        devices = iohid.IOHIDManagerCopyDevices(manager)
+        if not devices:
+            return None, None
+        count = int(libs["cf"].CFSetGetCount(devices))
+        values = (ctypes.c_void_p * max(1, count))()
+        libs["cf"].CFSetGetValues(devices, ctypes.byref(values))
+        best, best_id = None, 0
+        for index in range(count):
+            device = values[index]
+            if not device:
+                continue
+            report_id, has_input = _mac_device_info(device)
+            if not has_input:
+                best, best_id = device, report_id
+                break
+            if best is None:
+                best, best_id = device, report_id
+        return best, best_id
+    finally:
+        _cf_release(match)
+        _cf_release(manager)
+
+
+def _mac_device_info(device):
+    """(report_id, has_input) for one IOHIDDevice."""
+    libs = _mac()
+    iohid = libs["iohid"]
+    elements = iohid.IOHIDDeviceCopyMatchingElements(device, None, 0)
+    report_id, has_input = 0, False
+    if elements:
+        count = int(libs["cf"].CFSetGetCount(elements))
+        values = (ctypes.c_void_p * max(1, count))()
+        libs["cf"].CFSetGetValues(elements, ctypes.byref(values))
+        for index in range(min(count, 256)):
+            element = values[index]
+            if not element:
+                continue
+            etype = int(iohid.IOHIDElementGetType(element))
+            if etype in (1, 2, 3, 4, 128):  # input misc / button / axis
+                has_input = True
+            if etype in (129, 130, 131):  # output / feature
+                report_id = int(iohid.IOHIDElementGetReportID(element)) or report_id
+        _cf_release(elements)
+    return report_id, has_input
+
+
+class MacHidTransport(BaseTransport):
+    """IOHIDDeviceSetReport writer for the T1 config interface (macOS)."""
+
+    kind = "hid"
+
+    def __init__(self):
+        self._device = None
+        self._report_id = 3
+        self.last_error = None
+        self.node = "IOHIDDevice"
+
+    def is_open(self):
+        return self._device is not None
+
+    def close(self):
+        if self._device is not None:
+            try:
+                _mac()["iohid"].IOHIDDeviceClose(self._device, 0)
+            except Exception:
+                pass
+            _cf_release(self._device)
+        self._device = None
+
+    def open(self):
+        self.close()
+        try:
+            device, report_id = mac_find_device()
+        except Exception as exc:
+            self.last_error = "enum-failed: %s" % exc
+            return None
+        if not device:
+            self.last_error = "device-not-found"
+            return None
+        error = _mac()["iohid"].IOHIDDeviceOpen(device, 0)
+        if error:
+            self.last_error = "open-failed: error %d" % error
+            _cf_release(device)
+            return None
+        self._device = device
+        self._report_id = report_id or 3
+        return self._report_id, 64, True
+
+    def send_frame(self, frame, report_id=0, has_report_id=True):
+        if self._device is None:
+            return False
+        data = bytes(frame)
+        if has_report_id:
+            if not data:
+                return False
+            report_id, data = data[0], data[1:]
+        try:
+            buf = ctypes.create_string_buffer(data, len(data))
+            error = _mac()["iohid"].IOHIDDeviceSetReport(
+                self._device, 1, report_id, buf, len(data))
+        except Exception:
+            return False
+        return error == 0
+
+
+def make_transport():
+    if IS_WIN:
+        return WindowsHidTransport()
+    if IS_MAC:
+        return MacHidTransport()
+    return LinuxUsbfsTransport()
+class T1Device:
+    """Protocol layer: framing, probing and the write commands.
+
+    The platform specific send path lives in a transport (usbfs / HID);
+    this class only deals with report ids, frames and command sequences.
+    """
+
+    DEFAULT_DATA_LEN = 64
+
+    def __init__(self):
+        self.report_id = 3
+        self.data_len = self.DEFAULT_DATA_LEN
+        self.had_report_id = True
+        self._fail_count = 0
+        self._transport = make_transport()
+
+    # -- transport proxies --------------------------------------------------
+    @property
+    def last_error(self):
+        return self._transport.last_error
+
+    @last_error.setter
+    def last_error(self, value):
+        self._transport.last_error = value
+
+    @property
+    def node(self):
+        return self._transport.node
+
+    @property
+    def transport_kind(self):
+        return self._transport.kind
+
+    @property
+    def _urb_type(self):
+        return getattr(self._transport, "_urb_type", None)
+
+    def is_open(self):
+        return self._transport.is_open()
+
+    def close(self):
+        self._transport.close()
+
+    def connect(self):
+        self.close()
+        found = self._transport.open()
+        if found is None:
+            return False
+        rid, data_len, had_id = found
+        if rid is not None:
+            self.report_id, self.data_len, self.had_report_id = rid, data_len, had_id
+        else:
+            self.report_id, self.had_report_id = 3, True
+            self.data_len = self.DEFAULT_DATA_LEN
+        if not self.had_report_id:
+            self.report_id = 0
+        if not self.probe():
+            self.close()
+            self.last_error = "probe-failed"
+            return False
+        return True
+
+    # -- framing ------------------------------------------------------------
+    def frame(self, payload):
+        if self.had_report_id:
+            total = 1 + self.data_len
+            buf = bytearray(total)
+            buf[0] = self.report_id & 0xFF
+            body = bytes(payload)[:self.data_len]
+            buf[1:1 + len(body)] = body
+        else:
+            buf = bytearray(self.data_len)
+            body = bytes(payload)[:self.data_len]
+            buf[:len(body)] = body
+        return bytes(buf)
 
     def write_payload(self, payload):
-        if self.fd is None:
+        if not self.is_open():
             return False
-        ok = self._send_frame(self.frame(payload))
+        ok = self._transport.send_frame(
+            self.frame(payload), self.report_id, self.had_report_id)
         if ok:
             self._fail_count = 0
             return True
@@ -451,7 +1006,7 @@ class T1Device:
             self._fail_count = 0
             if self.write_payload(probe_report()):
                 return True
-            if self.fd is None:
+            if not self.is_open():
                 return False
         return False
 
@@ -556,7 +1111,7 @@ def hid_descriptor_lengths(config_data):
 
 
 # ---------------------------------------------------------------------------
-# evdev helpers / input nodes
+# input nodes / event sources (Linux evdev, Windows raw input, macOS IOHID)
 # ---------------------------------------------------------------------------
 
 EV_SYN, EV_KEY, EV_REL = 0x1, 0x2, 0x3
@@ -623,6 +1178,433 @@ def read_events(fd):
     return out
 
 
+# -- normalised key tables (settings stay portable between the OSes) --------
+
+def _vk_to_evdev():
+    table = {
+        0x08: 14, 0x09: 15, 0x0D: 28, 0x10: 42, 0x11: 29, 0x12: 56,
+        0x13: 119, 0x14: 58, 0x1B: 1, 0x20: 57, 0x2C: 99,
+        0x21: 104, 0x22: 109, 0x23: 107, 0x24: 102,
+        0x25: 105, 0x26: 103, 0x27: 106, 0x28: 108,
+        0x2D: 110, 0x2E: 111,
+        0x5B: 125, 0x5C: 126, 0x5D: 139,
+        0x90: 69, 0x91: 70,
+        0xA0: 42, 0xA1: 54, 0xA2: 29, 0xA3: 97, 0xA4: 56, 0xA5: 100,
+        0xAD: 113, 0xAE: 115, 0xAF: 114,
+        0xB0: 167, 0xB1: 166, 0xB2: 165, 0xB3: 164,
+        0xBD: 12, 0xBB: 13, 0xDB: 26, 0xDC: 43, 0xDD: 27,
+        0xBA: 39, 0xDE: 40, 0xC0: 41, 0xBC: 51, 0xBE: 52, 0xBF: 53,
+    }
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        table[0x41 + index] = code
+    table[0x30] = 11
+    for index in range(1, 10):
+        table[0x30 + index] = 1 + index
+    for index in range(12):
+        table[0x70 + index] = 59 + index if index < 10 else (87, 88)[index - 10]
+    for index, code in enumerate([71, 72, 73, 75, 76, 77, 79, 80, 81, 82]):
+        table[0x60 + index] = code
+    table.update({0x6A: 55, 0x6B: 78, 0x6D: 74, 0x6E: 83, 0x6F: 98})
+    return table
+
+
+def _hid_usage_to_evdev():
+    table = {}
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        table[4 + index] = code
+    for index in range(9):
+        table[0x1E + index] = 2 + index
+    table[0x27] = 11
+    table.update({
+        0x28: 28, 0x29: 1, 0x2A: 14, 0x2B: 15, 0x2C: 57,
+        0x2D: 12, 0x2E: 13, 0x2F: 26, 0x30: 27, 0x31: 43,
+        0x33: 39, 0x34: 40, 0x35: 41, 0x36: 51, 0x37: 52, 0x38: 53,
+        0x39: 58, 0x46: 99, 0x47: 70, 0x48: 119,
+        0x49: 110, 0x4A: 102, 0x4B: 104, 0x4C: 111, 0x4D: 107,
+        0x4E: 109, 0x4F: 106, 0x50: 105, 0x51: 108, 0x52: 103,
+        0x53: 69, 0x54: 98, 0x55: 55, 0x56: 74, 0x57: 78, 0x58: 96,
+        0xE0: 29, 0xE1: 42, 0xE2: 56, 0xE3: 125,
+        0xE4: 97, 0xE5: 54, 0xE6: 100, 0xE7: 126,
+        0x3A: 59, 0x3B: 60, 0x3C: 61, 0x3D: 62, 0x3E: 63, 0x3F: 64,
+        0x40: 65, 0x41: 66, 0x42: 67, 0x43: 68, 0x44: 87, 0x45: 88,
+    })
+    for offset, code in enumerate([71, 72, 73, 75, 76, 77, 79, 80, 81, 82]):
+        table[0x59 + offset] = code
+    return table
+
+
+def _consumer_to_evdev():
+    return {0xE2: 113, 0xE9: 114, 0xEA: 115,
+            0xB0: 167, 0xB5: 166, 0xCD: 164, 0xB7: 165}
+
+
+def build_input_names():
+    """{(evtype, code): name} used by --watch when the kernel header is absent.
+
+    Codes repeat across event types (6 is both KEY_5 and REL_HWHEEL), so the
+    event type is part of the key.
+    """
+    names = {}
+
+    def add(etype, code, name):
+        names[(etype, code)] = name
+
+    for etype, code, name in (
+            (EV_REL, 6, "REL_HWHEEL"), (EV_REL, 7, "REL_DIAL"),
+            (EV_REL, 8, "REL_WHEEL"), (EV_REL, 11, "REL_WHEEL_HI_RES"),
+            (EV_REL, 12, "REL_HWHEEL_HI_RES"),
+            (EV_KEY, 272, "BTN_LEFT"), (EV_KEY, 273, "BTN_RIGHT"),
+            (EV_KEY, 274, "BTN_MIDDLE"),
+            (EV_KEY, 113, "KEY_MUTE"), (EV_KEY, 114, "KEY_VOLUMEUP"),
+            (EV_KEY, 115, "KEY_VOLUMEDOWN"), (EV_KEY, 164, "KEY_PLAYPAUSE"),
+            (EV_KEY, 165, "KEY_STOPCD"), (EV_KEY, 166, "KEY_PREVIOUSSONG"),
+            (EV_KEY, 167, "KEY_NEXTSONG")):
+        add(etype, code, name)
+
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for index, code in enumerate([30, 48, 46, 32, 18, 33, 34, 35, 23, 36,
+                                  37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                                  22, 47, 17, 45, 21, 44]):
+        add(EV_KEY, code, "KEY_" + letters[index])
+    for index in range(9):
+        add(EV_KEY, 2 + index, "KEY_%d" % (index + 1))
+    add(EV_KEY, 11, "KEY_0")
+    for index in range(12):
+        add(EV_KEY, 59 + index if index < 10 else (87, 88)[index - 10],
+            "KEY_F%d" % (index + 1))
+    for code, name in (
+            (1, "KEY_ESC"), (14, "KEY_BACKSPACE"), (15, "KEY_TAB"),
+            (28, "KEY_ENTER"), (29, "KEY_LEFTCTRL"), (42, "KEY_LEFTSHIFT"),
+            (54, "KEY_RIGHTSHIFT"), (56, "KEY_LEFTALT"), (57, "KEY_SPACE"),
+            (58, "KEY_CAPSLOCK"), (97, "KEY_RIGHTCTRL"), (100, "KEY_RIGHTALT"),
+            (102, "KEY_HOME"), (103, "KEY_UP"), (104, "KEY_PAGEUP"),
+            (105, "KEY_LEFT"), (106, "KEY_RIGHT"), (107, "KEY_END"),
+            (108, "KEY_DOWN"), (109, "KEY_PAGEDOWN"), (110, "KEY_INSERT"),
+            (111, "KEY_DELETE"), (125, "KEY_LEFTMETA"), (126, "KEY_RIGHTMETA"),
+            (139, "KEY_MENU"), (99, "KEY_SYSRQ"), (69, "KEY_NUMLOCK"),
+            (70, "KEY_SCROLLLOCK"), (119, "KEY_PAUSE"), (12, "KEY_MINUS"),
+            (13, "KEY_EQUAL"), (26, "KEY_LEFTBRACE"), (27, "KEY_RIGHTBRACE"),
+            (39, "KEY_SEMICOLON"), (40, "KEY_APOSTROPHE"), (41, "KEY_GRAVE"),
+            (43, "KEY_BACKSLASH"), (51, "KEY_COMMA"), (52, "KEY_DOT"),
+            (53, "KEY_SLASH")):
+        add(EV_KEY, code, name)
+    return names
+
+
+VK_TO_EVDEV = _vk_to_evdev()
+HID_USAGE_TO_EVDEV = _hid_usage_to_evdev()
+CONSUMER_TO_EVDEV = _consumer_to_evdev()
+EVDEV_KEY_NAMES = build_input_names()
+
+
+class InputSource:
+    """Reads T1 input events and normalises them to (etype, code, value)."""
+
+    name = "input"
+
+    def wait(self, timeout):
+        """Return the events seen within timeout seconds."""
+        raise NotImplementedError
+
+    def describe(self):
+        return self.name
+
+    def close(self):
+        pass
+
+
+class LinuxInputSource(InputSource):
+    """evdev nodes of the T1 (test doubles patch open_input_nodes/select)."""
+
+    def __init__(self):
+        self.fds = open_input_nodes()
+        if not self.fds:
+            raise DeviceError("no readable T1 input node")
+        self.name = ", ".join(os.path.basename(path) for _, path in self.fds)
+
+    def wait(self, timeout):
+        ready, _, _ = select.select([fd for fd, _ in self.fds], [], [], timeout)
+        events = []
+        for fd in ready:
+            events.extend(read_events(fd))
+        return events
+
+    def close(self):
+        for fd, _ in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = []
+
+
+class QueueInputSource(InputSource):
+    """Shared helper: events are pushed by a backend thread."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._stop = threading.Event()
+        self.name = "input"
+
+    def _push(self, event):
+        self._queue.put(event)
+
+    def wait(self, timeout):
+        events = []
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            try:
+                events.append(self._queue.get(timeout=max(0.0, deadline - time.time())))
+            except queue.Empty:
+                break
+            if time.time() >= deadline:
+                break
+        return events
+
+    def close(self):
+        self._stop.set()
+
+
+class WindowsInputSource(QueueInputSource):
+    """Raw input (WM_INPUT) filtered to the T1, mapped to evdev codes."""
+
+    RIDEV_INPUTSINK = 0x00000100
+    WM_INPUT = 0x00FF
+    RI_KEY_BREAK = 0x0001
+    RID_INPUT = 1
+    RIDI_DEVICENAME = 1
+
+    def __init__(self):
+        super().__init__()
+        self.name = "raw-input"
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._message_loop()
+        except Exception:
+            log("windows input backend failed: %s" % sys.exc_info()[1])
+
+    def _message_loop(self):
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._user32 = user32
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint), ("style", ctypes.c_uint),
+                ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", ctypes.c_void_p),
+            ]
+
+        class RAWINPUTDEVICE(ctypes.Structure):
+            _fields_ = [("wUsagePage", ctypes.c_ushort), ("wUsage", ctypes.c_ushort),
+                        ("dwFlags", ctypes.c_uint), ("hwndTarget", ctypes.c_void_p)]
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+                                     ctypes.c_wparam, ctypes.c_lparam)
+        user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                          ctypes.c_wparam, ctypes.c_lparam]
+        user32.DefWindowProcW.restype = ctypes.c_long
+
+        def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_INPUT:
+                self._on_raw_input(user32, wparam, lparam)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wnd_proc = WNDPROC(wnd_proc)
+        wndclass = WNDCLASSEXW()
+        wndclass.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wndclass.lpfnWndProc = ctypes.cast(self._wnd_proc, ctypes.c_void_p)
+        wndclass.lpszClassName = "T1KeyboardRawInput"
+        if not user32.RegisterClassExW(ctypes.byref(wndclass)):
+            return
+        hwnd = user32.CreateWindowExW(
+            0, wndclass.lpszClassName, "t1", 0, 0, 0, 0, 0,
+            -3, None, None, None)  # HWND_MESSAGE window
+        if not hwnd:
+            return
+        devices = (RAWINPUTDEVICE * 2)(
+            RAWINPUTDEVICE(0x01, 0x06, self.RIDEV_INPUTSINK, hwnd),
+            RAWINPUTDEVICE(0x01, 0x02, self.RIDEV_INPUTSINK, hwnd))
+        if not user32.RegisterRawInputDevices(devices, 2, ctypes.sizeof(RAWINPUTDEVICE)):
+            user32.DestroyWindow(hwnd)
+            return
+        msg = wt.MSG()
+        while not self._stop.is_set():
+            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if result in (0, -1):
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        user32.DestroyWindow(hwnd)
+
+    def _on_raw_input(self, user32, wparam, lparam):
+        import ctypes.wintypes as wt
+
+        class RAWINPUTHEADER(ctypes.Structure):
+            _fields_ = [("dwType", ctypes.c_uint), ("dwSize", ctypes.c_uint),
+                        ("hDevice", ctypes.c_void_p), ("wParam", ctypes.c_wparam)]
+
+        size = wt.UINT(0)
+        user32.GetRawInputData(lparam, self.RID_INPUT, None, ctypes.byref(size),
+                               ctypes.sizeof(RAWINPUTHEADER))
+        if not size.value:
+            return
+        buf = ctypes.create_string_buffer(size.value)
+        if user32.GetRawInputData(lparam, self.RID_INPUT, buf, ctypes.byref(size),
+                                  ctypes.sizeof(RAWINPUTHEADER)) < 0:
+            return
+        header = ctypes.cast(buf, ctypes.POINTER(RAWINPUTHEADER)).contents
+        if not self._is_t1_device(user32, header.hDevice):
+            return
+        body = ctypes.addressof(buf) + ctypes.sizeof(RAWINPUTHEADER)
+        if header.dwType == 0:  # RIM_TYPEKEYBOARD
+            flags = ctypes.c_ushort.from_address(body + 2).value
+            vkey = ctypes.c_ushort.from_address(body + 4).value
+            code = VK_TO_EVDEV.get(vkey)
+            if code is None:
+                return
+            self._push((EV_KEY, code, 0 if flags & self.RI_KEY_BREAK else 1))
+        elif header.dwType == 1:  # RIM_TYPEMOUSE
+            button_flags = ctypes.c_ushort.from_address(body + 4).value
+            button_data = ctypes.c_short.from_address(body + 6).value
+            self._push_mouse(button_flags, button_data)
+
+    def _push_mouse(self, flags, data):
+        for bit, code in ((0x0001, 272), (0x0004, 273), (0x0010, 274)):
+            if flags & bit:
+                self._push((EV_KEY, code, 1))
+            if flags & (bit << 1):
+                self._push((EV_KEY, code, 0))
+        if flags & 0x0400:  # RI_MOUSE_WHEEL
+            self._push((EV_REL, 8, 1 if data > 0 else -1))
+        if flags & 0x0800:  # RI_MOUSE_HWHEEL
+            self._push((EV_REL, 6, 1 if data > 0 else -1))
+
+    def _is_t1_device(self, user32, hdevice):
+        if not hdevice:
+            return False
+        if not hasattr(self, "_t1_devices"):
+            self._t1_devices = {}
+        known = self._t1_devices.get(hdevice)
+        if known is not None:
+            return known
+        import ctypes.wintypes as wt
+
+        length = wt.UINT(0)
+        user32.GetRawInputDeviceInfoW(hdevice, self.RIDI_DEVICENAME, None,
+                                      ctypes.byref(length))
+        if not length.value:
+            return False
+        buf = ctypes.create_string_buffer((length.value + 1) * 2)
+        if user32.GetRawInputDeviceInfoW(hdevice, self.RIDI_DEVICENAME, buf,
+                                         ctypes.byref(length)) < 0:
+            return False
+        path = buf.value.decode("utf-16", "replace").lower()
+        found = "vid_1189" in path and "pid_8890" in path
+        if len(self._t1_devices) < 32:
+            self._t1_devices[hdevice] = found
+        return found
+
+
+class MacInputSource(QueueInputSource):
+    """IOHID input value callbacks mapped to evdev codes."""
+
+    def __init__(self):
+        super().__init__()
+        self.name = "IOHIDDevice"
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._register()
+        except Exception:
+            log("macos input backend failed: %s" % sys.exc_info()[1])
+
+    def _register(self):
+        import ctypes.util
+
+        libs = _mac()
+        cf, iohid = libs["cf"], libs["iohid"]
+        if not hasattr(iohid, "IOHIDManagerRegisterInputValueCallback"):
+            return
+        manager = iohid.IOHIDManagerCreate(None, 0)
+        if not manager:
+            return
+        match = _cf_dict([("VendorID", "%d" % VID), ("ProductID", "%d" % PID)])
+        iohid.IOHIDManagerSetDeviceMatching(manager, match)
+        callback_type = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+        self._callback = callback_type(self._on_input)
+        iohid.IOHIDManagerRegisterInputValueCallback(manager, self._callback, None)
+        iohid.IOHIDManagerOpen(manager, 0)
+        run_loop = cf.CFRunLoopGetCurrent()
+        mode = cf.CFStringCreateWithCString(
+            None, b"kCFRunLoopDefaultMode", 0x08000100)
+        iohid.IOHIDManagerScheduleWithRunLoop(manager, run_loop, mode)
+        while not self._stop.is_set():
+            cf.CFRunLoopRunInMode(mode, 0.25, 0)
+        _cf_release(mode)
+
+    def _on_input(self, _context, _result, _sender, _value):
+        try:
+            libs = _mac()
+            iohid = libs["iohid"]
+            usage_page = int(iohid.IOHIDValueGetUsagePage(_value))
+            usage = int(iohid.IOHIDValueGetUsage(_value))
+            number = int(iohid.IOHIDValueGetIntegerValue(_value))
+            if usage_page == 0x07:
+                code = HID_USAGE_TO_EVDEV.get(usage)
+                if code is None:
+                    return
+                self._push((EV_KEY, code, 1 if number else 0))
+            elif usage_page == 0x0C:
+                code = CONSUMER_TO_EVDEV.get(usage)
+                if code is not None:
+                    self._push((EV_KEY, code, 1 if number else 0))
+            elif usage_page == 0x01:
+                if usage == 0x38:  # wheel
+                    self._push((EV_REL, 8, 1 if number > 0 else (-1 if number else 0)))
+                elif usage == 0x36:  # AC pan / horizontal wheel
+                    self._push((EV_REL, 6, 1 if number > 0 else (-1 if number else 0)))
+                elif usage in (0x09, 0x0A, 0x0B):
+                    self._push((EV_KEY, {0x09: 272, 0x0A: 273, 0x0B: 274}[usage],
+                                1 if number else 0))
+        except Exception:
+            pass
+
+
+def open_input_source():
+    """Best available T1 input source on this platform (None when unavailable)."""
+    try:
+        if IS_WIN:
+            return WindowsInputSource()
+        if IS_MAC:
+            return MacInputSource()
+        return LinuxInputSource()
+    except DeviceError:
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# volume backends
+# ---------------------------------------------------------------------------
+
+
 def which_wpctl():
     return shutil.which("wpctl")
 
@@ -644,6 +1626,120 @@ def wpctl_volume(target, delta=None, absolute=None):
         return True
     except Exception:
         return False
+
+
+def _windows_volume(kind, delta=None, absolute=None):
+    """Core Audio (IAudioEndpointVolume) with a media-key fallback."""
+    try:
+        return _windows_core_volume(kind, delta, absolute)
+    except Exception:
+        pass
+    try:
+        if delta:
+            import ctypes.wintypes as wt
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            key = 0xAF if delta > 0 else 0xAE
+            user32.keybd_event(key, 0, 0, 0)
+            user32.keybd_event(key, 0, 2, 0)  # KEYEVENTF_KEYUP
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _windows_core_volume(kind, delta=None, absolute=None):
+    import ctypes.wintypes as wt
+
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitializeEx(None, 0)
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    def make_guid(text):
+        parts = text.replace("-", "").split()
+        value = GUID()
+        value.Data1 = int(parts[0], 16)
+        value.Data2 = int(parts[1], 16)
+        value.Data3 = int(parts[2], 16)
+        value.Data4 = (ctypes.c_ubyte * 8)(
+            *[int(parts[3][i:i + 2], 16) for i in range(0, 16, 2)])
+        return value
+
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+        ctypes.c_void_p]
+    enumerator = ctypes.c_void_p()
+    hr = ole32.CoCreateInstance(
+        ctypes.byref(make_guid("BCDE0395-E52F-467C-8E3D-C4579291692E")),
+        None, 23,
+        ctypes.byref(make_guid("A95664D2-9614-4F35-A746-DE8DB63617E6")),
+        ctypes.byref(enumerator))
+    if hr or not enumerator.value:
+        return False
+    device = ctypes.c_void_p()
+    vtable = ctypes.POINTER(ctypes.c_void_p).from_address(enumerator.value)
+    get_default = ctypes.CFUNCTYPE(
+        ctypes.c_long, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p)(vtable[5])
+    hr = get_default(enumerator, 1 if kind == "source" else 0, 1,
+                     ctypes.byref(device))
+    if hr or not device.value:
+        return False
+    volume = ctypes.c_void_p()
+    dtable = ctypes.POINTER(ctypes.c_void_p).from_address(device.value)
+    activate = ctypes.CFUNCTYPE(
+        ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.c_void_p, ctypes.c_void_p)(dtable[3])
+    empty = (ctypes.c_ubyte * 16)()
+    hr = activate(device, ctypes.byref(make_guid("5CDF2C82-841E-454D-97D2-52926851F1CC")),
+                  1, empty, ctypes.byref(volume))
+    if hr or not volume.value:
+        return False
+    vtable_v = ctypes.POINTER(ctypes.c_void_p).from_address(volume.value)
+    if absolute is not None:
+        setter = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_float,
+                                  ctypes.c_void_p)(vtable_v[7])
+        return setter(volume, ctypes.c_float(max(0.0, min(1.0, absolute))), None) == 0
+    getter = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                              ctypes.c_void_p)(vtable_v[9])
+    level = ctypes.c_float(0.0)
+    if getter(volume, ctypes.byref(level), None) != 0:
+        return False
+    setter = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_float,
+                              ctypes.c_void_p)(vtable_v[7])
+    return setter(volume, ctypes.c_float(max(0.0, min(1.0, level.value + delta))), None) == 0
+
+
+def _macos_volume(kind, delta=None, absolute=None):
+    try:
+        if absolute is not None:
+            value = int(round(max(0.0, min(1.0, absolute)) * 100))
+        elif delta is not None:
+            key = "input volume" if kind == "source" else "output volume"
+            current = subprocess.run(
+                ["osascript", "-e", "get %s of (get volume settings)" % key],
+                capture_output=True, text=True, timeout=3)
+            value = int(round(float(current.stdout.strip() or 0) + delta * 100))
+        else:
+            return False
+        value = max(0, min(100, value))
+        target = "input volume" if kind == "source" else "output volume"
+        subprocess.run(["osascript", "-e", "set volume %s %d" % (target, value)],
+                       capture_output=True, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def set_volume(kind, delta=None, absolute=None):
+    """Adjust the default sink ("sink") or source ("source"). Returns bool."""
+    if IS_WIN:
+        return _windows_volume(kind, delta, absolute)
+    if IS_MAC:
+        return _macos_volume(kind, delta, absolute)
+    target = "@DEFAULT_AUDIO_SINK@" if kind == "sink" else "@DEFAULT_AUDIO_SOURCE@"
+    return wpctl_volume(target, delta=delta, absolute=absolute)
 
 
 class OscSender:
@@ -695,21 +1791,62 @@ def log(message):
         pass
 
 
+def pid_file_path():
+    return os.path.join(STATE_DIR, "monitor.pid")
+
+
+def write_pid_file():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(pid_file_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def remove_pid_file():
+    try:
+        os.remove(pid_file_path())
+    except OSError:
+        pass
+
+
+def _exit_on_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def run_monitor():
     log("monitor starting (pid %d)" % os.getpid())
+    write_pid_file()
+    previous = None
+    try:
+        previous = signal.signal(signal.SIGTERM, _exit_on_signal)
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread / unsupported signal
+    try:
+        _monitor_loop()
+    finally:
+        if previous is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous)
+            except (ValueError, OSError, AttributeError):
+                pass
+        remove_pid_file()
+
+
+def _monitor_loop():
     settings = load_settings()
     mtime = _settings_mtime()
     osc_cfg = settings.get("osc", {})
     osc = OscSender(osc_cfg.get("host", "127.0.0.1"), osc_cfg.get("port", 9000))
 
-    fds = []
+    source = None
     bindings = {}
     rotate_codes = set()
     push_code = None
     modes = ["mic", "headphone", "user"]
     mode_idx = 0
     user_vol = 0.5
-    prev_push = False
 
     def reload_settings():
         nonlocal settings, osc, bindings, rotate_codes, push_code
@@ -732,68 +1869,66 @@ def run_monitor():
     warned_empty = False
 
     while True:
-        if not fds:
-            fds = open_input_nodes()
-            if not fds:
+        if source is None:
+            source = open_input_source()
+            if source is None:
                 if not warned_empty:
                     warned_empty = True
                     log("no readable input node yet (udev rule / permissions?)")
                 time.sleep(2.0)
                 continue
             warned_empty = False
-            log("monitor attached to " + ", ".join(p for _, p in fds))
+            log("monitor attached to " + source.describe())
         if _settings_mtime() != mtime:
             mtime = _settings_mtime()
             reload_settings()
 
         try:
-            ready, _, _ = select.select([fd for fd, _ in fds], [], [], 0.25)
+            events = source.wait(0.25)
         except (OSError, ValueError):
-            fds = []
+            source.close()
+            source = None
             continue
-        if not ready:
-            continue
-        for fd in ready:
-            for etype, code, value in read_events(fd):
-                if etype == EV_KEY and value == 1:
-                    if push_code is not None and code == push_code:
-                        mode_idx = (mode_idx + 1) % max(1, len(modes))
-                        dial = settings.setdefault("dial", {})
-                        dial["start_index"] = mode_idx
+        for etype, code, value in events:
+            if etype == EV_KEY and value == 1:
+                if push_code is not None and code == push_code:
+                    mode_idx = (mode_idx + 1) % max(1, len(modes))
+                    dial = settings.setdefault("dial", {})
+                    dial["start_index"] = mode_idx
+                    save_settings(settings)
+                    log("dial mode -> %s" % modes[mode_idx])
+                    continue
+                if code in bindings:
+                    address, toggle = bindings[code]
+                    if toggle:
+                        state = settings.setdefault("_osc_state", {})
+                        new_state = not state.get(str(code), False)
+                        state[str(code)] = new_state
                         save_settings(settings)
-                        log("dial mode -> %s" % modes[mode_idx])
-                        continue
-                    if code in bindings:
-                        address, toggle = bindings[code]
-                        if toggle:
-                            state = settings.setdefault("_osc_state", {})
-                            new_state = not state.get(str(code), False)
-                            state[str(code)] = new_state
-                            save_settings(settings)
-                            osc.send_bool(address, new_state)
-                        else:
-                            osc.send_bool(address, True)
-                elif etype == EV_KEY and value == 0:
-                    if code in bindings and not bindings[code][1]:
-                        osc.send_bool(bindings[code][0], False)
-                elif etype == EV_REL and code in rotate_codes:
-                    if value == 0:
-                        continue
-                    dial = settings.get("dial", {})
-                    step = float(dial.get("step", 0.05))
-                    direction = step if value > 0 else -step
-                    mode = modes[mode_idx] if modes else "mic"
-                    if mode == "mic":
-                        wpctl_volume("@DEFAULT_AUDIO_SOURCE@", delta=direction)
-                    elif mode == "headphone":
-                        wpctl_volume("@DEFAULT_AUDIO_SINK@", delta=direction)
+                        osc.send_bool(address, new_state)
                     else:
-                        user_vol = max(0.0, min(1.0, user_vol + direction))
-                        address = settings.get("osc", {}).get(
-                            "user_volume_addr", "/avatar/parameters/UserVolume")
-                        osc.send_float(address, user_vol)
-                        settings["_user_vol"] = user_vol
-                        save_settings(settings)
+                        osc.send_bool(address, True)
+            elif etype == EV_KEY and value == 0:
+                if code in bindings and not bindings[code][1]:
+                    osc.send_bool(bindings[code][0], False)
+            elif etype == EV_REL and code in rotate_codes:
+                if value == 0:
+                    continue
+                dial = settings.get("dial", {})
+                step = float(dial.get("step", 0.05))
+                direction = step if value > 0 else -step
+                mode = modes[mode_idx] if modes else "mic"
+                if mode == "mic":
+                    set_volume("source", delta=direction)
+                elif mode == "headphone":
+                    set_volume("sink", delta=direction)
+                else:
+                    user_vol = max(0.0, min(1.0, user_vol + direction))
+                    address = settings.get("osc", {}).get(
+                        "user_volume_addr", "/avatar/parameters/UserVolume")
+                    osc.send_float(address, user_vol)
+                    settings["_user_vol"] = user_vol
+                    save_settings(settings)
 
 
 def _settings_mtime():
@@ -955,7 +2090,34 @@ DIAL_MODES = [
 ]
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid_file():
+    try:
+        with open(pid_file_path(), encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 and _pid_alive(pid) else None
+
+
 def monitor_is_running():
+    if _read_pid_file():
+        return True
+    if os.path.exists(pid_file_path()):
+        remove_pid_file()  # stale: the recorded pid is gone
+    if not IS_LINUX:
+        return False
     try:
         out = subprocess.run(["pgrep", "-f", "%s --monitor" % APP_NAME],
                              capture_output=True, text=True, timeout=3)
@@ -965,19 +2127,40 @@ def monitor_is_running():
 
 
 def start_monitor_process():
-    if not which_wpctl():
+    if IS_LINUX and not which_wpctl():
         return False, "wpctl not found (install pipewire-utils)"
     try:
         script = os.path.abspath(globals().get("__file__", sys.argv[0]))
-        subprocess.Popen([sys.executable, script, "--monitor"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        command = [sys.executable, script, "--monitor"]
+        if IS_WIN:
+            subprocess.Popen(
+                command,
+                creationflags=0x00000008 | 0x00000200,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True)
+        else:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
         return True, None
     except Exception as exc:
         return False, str(exc)
 
 
 def stop_monitor_process():
+    pid = _read_pid_file()
+    if pid:
+        try:
+            if IS_WIN:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=5)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            remove_pid_file()
+            return True
+        except Exception:
+            return False
+    if not IS_LINUX:
+        return False
     try:
         subprocess.run(["pkill", "-f", "%s --monitor" % APP_NAME],
                        capture_output=True, timeout=3)
@@ -991,10 +2174,15 @@ def stop_monitor_process():
 # ---------------------------------------------------------------------------
 
 def run_gui():
-    import gi
-    gi.require_version("Gtk", "4.0")
-    gi.require_version("Adw", "1")
-    from gi.repository import Gtk, Adw, GLib
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:
+        print("Tkinter is required for the GUI: %s" % exc, file=sys.stderr)
+        print("Install it first (Arch: sudo pacman -S tk / "
+              "Debian: sudo apt install python3-tk / macOS: brew install python-tk)",
+              file=sys.stderr)
+        return 1
 
     class LearnThread(threading.Thread):
         def __init__(self, seconds, want_key=True, want_rel=False, ignore=()):
@@ -1005,37 +2193,41 @@ def run_gui():
             self.ignore = set(ignore)
             self.result = None
             self.done = False
+            self._stop = threading.Event()
+
+        def _collect(self, source, deadline):
+            for etype, code, value in source.wait(
+                    max(0.05, min(0.5, deadline - time.time()))):
+                if value != 1:
+                    continue
+                if etype == EV_KEY and self.want_key and code not in self.ignore:
+                    self.result = ("key", code)
+                    self.done = True
+                    raise StopIteration
+                if etype == EV_REL and self.want_rel:
+                    self.result = ("rel", code)
+                    self.done = True
+                    raise StopIteration
 
         def run(self):
-            fds = open_input_nodes()
-            if not fds:
+            source = open_input_source()
+            if source is None:
                 self.done = True
                 return
             deadline = time.time() + self.seconds
-            while time.time() < deadline:
-                try:
-                    ready, _, _ = select.select([fd for fd, _ in fds], [], [],
-                                                max(0.0, deadline - time.time()))
-                except (OSError, ValueError):
-                    break
-                for fd in ready:
-                    for etype, code, value in read_events(fd):
-                        if value != 1:
-                            continue
-                        if etype == EV_KEY and self.want_key and code not in self.ignore:
-                            self.result = ("key", code)
-                            self.done = True
-                            return
-                        if etype == EV_REL and self.want_rel:
-                            self.result = ("rel", code)
-                            self.done = True
-                            return
-            self.done = True
+            try:
+                while time.time() < deadline:
+                    try:
+                        self._collect(source, deadline)
+                    except StopIteration:
+                        return
+            finally:
+                source.close()
+                self.done = True
 
-    class MainWindow(Adw.ApplicationWindow):
-        def __init__(self, app):
-            super().__init__(application=app, title=I18N["en"]["app"])
-            self.set_default_size(980, 700)
+    class MainWindow:
+        def __init__(self, root):
+            self.root = root
             self.dev = T1Device()
             self.settings = load_settings()
             self.lang = self.settings.get("lang", "ja")
@@ -1043,354 +2235,360 @@ def run_gui():
             self.selected_key = None
             self.pending = None
             self.groups = []
-            self.group_mod = 0
             self._learn = None
             self._last_conn = False
             self._tried_permission = False
             self._last_error = None
+            self._updating = True
 
-            hb = Adw.HeaderBar()
-            self.title_label = Gtk.Label()
-            hb.set_title_widget(self.title_label)
-            self.lang_btn = Gtk.Button(label="EN")
-            self.lang_btn.connect("clicked", self.on_toggle_lang)
-            hb.pack_end(self.lang_btn)
+            root.title(I18N["en"]["app"])
+            root.geometry("980x700")
+            root.minsize(760, 520)
 
-            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            outer.set_margin_top(8)
-            outer.set_margin_bottom(8)
-            outer.set_margin_start(8)
-            outer.set_margin_end(8)
+            self._build_header()
+            body = ttk.Frame(root)
+            body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            self._build_left(body)
+            self._build_notebook(body)
+            self._updating = False
 
-            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            self.status_dot = Gtk.Label(label="●")
-            self.status_txt = Gtk.Label()
-            top.append(self.status_dot)
-            top.append(self.status_txt)
-            self.layer_label = Gtk.Label()
-            top.append(self.layer_label)
-            self.layer_dd = Gtk.DropDown(model=Gtk.StringList.new(["1", "2", "3"]))
-            self.layer_dd.set_selected(self.layer - 1)
-            self.layer_dd.connect("notify::selected", self.on_layer_changed)
-            top.append(self.layer_dd)
-            help_btn = Gtk.Button(label="?")
-            help_btn.connect("clicked", self.on_help)
-            top.append(help_btn)
-            self.toast = Gtk.Label(label="", hexpand=True, xalign=1)
-            top.append(self.toast)
-            outer.append(top)
-
-            body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            body.set_vexpand(True)
-
-            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            self.key_label = Gtk.Label(xalign=0)
-            left.append(self.key_label)
-            flow = Gtk.FlowBox()
-            flow.set_min_children_per_line(3)
-            flow.set_max_children_per_line(6)
-            flow.set_selection_mode(Gtk.SelectionMode.NONE)
-            self.key_buttons = {}
-            for name, num in PHYS_KEYS:
-                button = Gtk.Button(label=name)
-                button.add_css_class("osd")
-                button.connect("clicked", self.on_pick_key, num)
-                self.key_buttons[num] = button
-                flow.append(button)
-            left.append(flow)
-
-            self.assign_label = Gtk.Label(xalign=0)
-            self.assign_label.set_wrap(True)
-            left.append(self.assign_label)
-
-            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            self.dl_btn = Gtk.Button()
-            self.dl_btn.add_css_class("suggested-action")
-            self.dl_btn.connect("clicked", self.on_download)
-            actions.append(self.dl_btn)
-            clear_btn = Gtk.Button()
-            clear_btn.connect("clicked", self.on_clear)
-            self.clear_btn = clear_btn
-            actions.append(clear_btn)
-            self.disable_btn = Gtk.Button()
-            self.disable_btn.connect("clicked", self.on_disable)
-            left.append(actions)
-            left.append(self.disable_btn)
-            body.append(left)
-
-            self.notebook = Gtk.Notebook()
-            self.notebook.set_vexpand(True)
-            self.pages = {}
-
-            self.notebook.append_page(*self.build_key_page())
-            self.notebook.append_page(*self.build_modifier_page())
-            self.notebook.append_page(*self.build_media_page())
-            self.notebook.append_page(*self.build_mouse_page())
-            self.notebook.append_page(*self.build_led_page())
-            self.notebook.append_page(*self.build_osc_page())
-            self.notebook.append_page(*self.build_dial_page())
-            self.notebook.append_page(*self.build_about_page())
-            body.append(self.notebook)
-            outer.append(body)
-
-            self.scroller = Gtk.ScrolledWindow()
-            self.scroller.set_child(outer)
-            self.set_content(self.scroller)
             self.apply_lang()
             self.refresh_assignment()
-            GLib.timeout_add_seconds(1, self.tick_connect)
+            self.tick_connect()
 
-        # -- pages ---------------------------------------------------------
-        def build_key_page(self):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            box.set_vexpand(True)
-            self.basic_list = Gtk.ListBox()
-            self.basic_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-            self.basic_list.connect("row-activated", self.on_basic_activated)
-            for label, usage in USAGE_KEYS:
-                row = Gtk.ListBoxRow()
-                row.usage = usage
-                row.set_child(Gtk.Label(label=label, xalign=0))
-                self.basic_list.append(row)
-            scroll = Gtk.ScrolledWindow()
-            scroll.set_child(self.basic_list)
-            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            scroll.set_vexpand(True)
-            box.append(scroll)
-            self.pages["key"] = box
-            return box, Gtk.Label()
+        # -- construction ---------------------------------------------------
+        def _build_header(self):
+            top = ttk.Frame(self.root)
+            top.pack(fill="x", padx=8, pady=8)
 
-        def build_modifier_page(self):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            box.set_margin_top(8)
-            box.set_margin_start(8)
-            box.set_margin_end(8)
-            grid = Gtk.FlowBox()
-            grid.set_max_children_per_line(4)
-            grid.set_selection_mode(Gtk.SelectionMode.NONE)
+            self.status_dot = tk.Label(top, text="●", fg="red",
+                                       font=("TkDefaultFont", 12))
+            self.status_dot.pack(side="left")
+            self.status_txt = tk.Label(top, text="")
+            self.status_txt.pack(side="left", padx=(4, 12))
+            self.layer_label = tk.Label(top, text="")
+            self.layer_label.pack(side="left")
+            self.layer_var = tk.StringVar(value=str(self.layer))
+            self.layer_box = ttk.Combobox(top, textvariable=self.layer_var,
+                                          values=["1", "2", "3"], width=3,
+                                          state="readonly")
+            self.layer_box.pack(side="left", padx=(4, 12))
+            self.layer_box.bind("<<ComboboxSelected>>", self.on_layer_changed)
+            ttk.Button(top, text="?", width=3, command=self.on_help).pack(side="left")
+            self.toast = tk.Label(top, text="", anchor="e")
+            self.toast.pack(side="right", fill="x", expand=True, padx=8)
+            self.lang_btn = ttk.Button(top, text="EN", width=4,
+                                       command=self.on_toggle_lang)
+            self.lang_btn.pack(side="right")
+
+        def _build_left(self, parent):
+            left = ttk.Frame(parent, width=320)
+            left.pack(side="left", fill="y", padx=(0, 8))
+            left.pack_propagate(False)
+
+            self.key_label = tk.Label(left, text="", anchor="w", font=self._bold())
+            self.key_label.pack(fill="x", pady=(0, 4))
+
+            grid = tk.Frame(left)
+            grid.pack(fill="x")
+            self.key_buttons = {}
+            for index, (name, num) in enumerate(PHYS_KEYS):
+                button = tk.Button(grid, text=name, width=9, relief="raised",
+                                   command=lambda n=num: self.on_pick_key(n))
+                if not self.key_buttons:
+                    self._key_bg = button.cget("bg")
+                button.grid(row=index // 3, column=index % 3, padx=2, pady=2,
+                            sticky="we")
+                self.key_buttons[num] = button
+            for column in range(3):
+                grid.columnconfigure(column, weight=1)
+
+            self.assign_label = tk.Label(left, text="", anchor="w", justify="left",
+                                         wraplength=300)
+            self.assign_label.pack(fill="x", pady=(10, 8))
+
+            actions = ttk.Frame(left)
+            actions.pack(fill="x")
+            self.dl_btn = ttk.Button(actions, text="Write", command=self.on_download)
+            self.dl_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            self.clear_btn = ttk.Button(actions, text="Clear", command=self.on_clear)
+            self.clear_btn.pack(side="left")
+            self.disable_btn = ttk.Button(left, text="Disable",
+                                          command=self.on_disable)
+            self.disable_btn.pack(fill="x", pady=(6, 0))
+
+        def _build_notebook(self, parent):
+            self.notebook = ttk.Notebook(parent)
+            self.notebook.pack(side="left", fill="both", expand=True)
+            self.pages = []
+
+            self._build_key_page()
+            self._build_modifier_page()
+            self._build_media_page()
+            self._build_mouse_page()
+            self._build_led_page()
+            self._build_osc_page()
+            self._build_dial_page()
+            self._build_about_page()
+
+        @staticmethod
+        def _bold():
+            return ("TkDefaultFont", 10, "bold")
+
+        def _add_page(self, widget):
+            self.notebook.add(widget, text="")
+            self.pages.append(widget)
+            return widget
+
+        def _list_page(self, rows, on_activate):
+            frame = ttk.Frame(self.notebook)
+            box = tk.Listbox(frame, exportselection=False, activestyle="dotbox")
+            box.pack(fill="both", expand=True, padx=6, pady=6)
+            for label, payload in rows:
+                box.insert("end", label)
+            box.bind("<Double-Button-1>", lambda _e: on_activate(box))
+            box.bind("<Return>", lambda _e: on_activate(box))
+            self._add_page(frame)
+            return frame, box
+
+        def _build_key_page(self):
+            def activate(box):
+                selection = box.curselection()
+                if not selection:
+                    self.status(self.tr("pick_function"))
+                    return
+                index = selection[0]
+                self.pending = {"kind": "key", "desc": USAGE_KEYS[index][0],
+                                "keys": [(0, USAGE_KEYS[index][1])], "lone_mod": 0}
+                self.write_pending()
+
+            _, self.basic_list = self._list_page(USAGE_KEYS, activate)
+
+        def _build_modifier_page(self):
+            frame = ttk.Frame(self.notebook)
+            self._add_page(frame)
+            grid = ttk.Frame(frame)
+            grid.pack(fill="x", padx=8, pady=(8, 4))
             self.mod_checks = {}
-            for name, mask in MODIFIERS:
-                check = Gtk.CheckButton(label=name)
-                check.mask = mask
-                self.mod_checks[mask] = check
-                grid.append(check)
-            box.append(grid)
-            box.append(Gtk.Label(label="Base key / ベースキー", xalign=0))
-            self.base_dd = Gtk.DropDown(
-                model=Gtk.StringList.new(["(modifier only) / 修飾のみ"] +
-                                         [name for name, _ in USAGE_KEYS]))
-            box.append(self.base_dd)
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            add_btn = Gtk.Button(label="+ Add group / グループ追加")
-            add_btn.connect("clicked", self.on_add_group)
-            row.append(add_btn)
-            reset_btn = Gtk.Button(label="Reset / リセット")
-            reset_btn.connect("clicked", self.on_reset_groups)
-            row.append(reset_btn)
-            box.append(row)
-            scroll_groups = Gtk.ScrolledWindow()
-            self.groups_list = Gtk.ListBox()
-            self.groups_list.set_selection_mode(Gtk.SelectionMode.NONE)
-            scroll_groups.set_child(self.groups_list)
-            scroll_groups.set_vexpand(True)
-            box.append(scroll_groups)
-            self.pages["fun"] = box
-            return box, Gtk.Label()
+            for index, (name, mask) in enumerate(MODIFIERS):
+                var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(grid, text=name, variable=var).grid(
+                    row=index // 4, column=index % 4, sticky="w", padx=4, pady=2)
+                self.mod_checks[mask] = var
 
-        def build_media_page(self):
-            media_list = Gtk.ListBox()
-            media_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-            media_list.connect("row-activated", self.on_media_activated)
-            for action, label in MEDIA_ACTIONS:
-                row = Gtk.ListBoxRow()
-                row.action = action
-                row.desc = label
-                row.set_child(Gtk.Label(label=label, xalign=0))
-                media_list.append(row)
-            self.pages["media"] = media_list
-            return media_list, Gtk.Label()
+            ttk.Label(frame, text="Base key / ベースキー").pack(anchor="w",
+                                                                padx=8, pady=(6, 2))
+            self.base_var = tk.StringVar(value="(modifier only) / 修飾のみ")
+            self.base_dd = ttk.Combobox(
+                frame, textvariable=self.base_var, state="readonly",
+                values=["(modifier only) / 修飾のみ"] + [n for n, _ in USAGE_KEYS])
+            self.base_dd.pack(fill="x", padx=8)
 
-        def build_mouse_page(self):
-            mouse_list = Gtk.ListBox()
-            mouse_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-            mouse_list.connect("row-activated", self.on_mouse_activated)
-            for action, label in MOUSE_ACTIONS:
-                row = Gtk.ListBoxRow()
-                row.action = action
-                row.desc = label
-                row.set_child(Gtk.Label(label=label, xalign=0))
-                mouse_list.append(row)
-            self.pages["mouse"] = mouse_list
-            return mouse_list, Gtk.Label()
+            row = ttk.Frame(frame)
+            row.pack(fill="x", padx=8, pady=6)
+            ttk.Button(row, text="+ Add group / グループ追加",
+                       command=self.on_add_group).pack(side="left")
+            ttk.Button(row, text="Reset / リセット",
+                       command=self.on_reset_groups).pack(side="left", padx=6)
 
-        def build_led_page(self):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            box.set_margin_top(8)
-            box.set_margin_start(8)
-            box.set_margin_end(8)
-            self.led_list = Gtk.ListBox()
-            self.led_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-            self.led_list.connect("row-activated", self.on_led_activated)
-            for value, label in LED_MODES:
-                row = Gtk.ListBoxRow()
-                row.mode = value
-                row.desc = label
-                row.set_child(Gtk.Label(label=label, xalign=0))
-                self.led_list.append(row)
-            box.append(self.led_list)
-            self.pages["led"] = box
-            return box, Gtk.Label()
+            self.groups_list = tk.Listbox(frame, height=8, exportselection=False)
+            self.groups_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        def build_osc_page(self):
-            outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            outer_box.set_margin_top(8)
-            outer_box.set_margin_start(8)
-            outer_box.set_margin_end(8)
-            host_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            host_row.append(Gtk.Label(label="Host:"))
-            self.osc_host = Gtk.Entry(text=self.settings.get("osc", {}).get("host", "127.0.0.1"))
-            self.osc_host.connect("changed", self.on_osc_host)
-            host_row.append(self.osc_host)
-            host_row.append(Gtk.Label(label="Port:"))
-            self.osc_port = Gtk.Entry(
-                text=str(self.settings.get("osc", {}).get("port", 9000)))
-            self.osc_port.connect("changed", self.on_osc_port)
-            host_row.append(self.osc_port)
-            outer_box.append(host_row)
-            outer_box.append(Gtk.Label(label=self.settings.get("osc", {}).get(
-                "user_volume_addr", "/avatar/parameters/UserVolume"), xalign=0))
-            self.osc_hint = Gtk.Label(xalign=0)
-            self.osc_hint.set_wrap(True)
-            outer_box.append(self.osc_hint)
-            scroll = Gtk.ScrolledWindow()
-            table = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        def _build_media_page(self):
+            def activate(box):
+                selection = box.curselection()
+                if not selection:
+                    self.status(self.tr("pick_function"))
+                    return
+                action, desc = MEDIA_ACTIONS[selection[0]]
+                self.pending = {"kind": "media", "action": action, "desc": desc}
+                self.write_pending()
+
+            _, self.media_list = self._list_page(MEDIA_ACTIONS, activate)
+
+        def _build_mouse_page(self):
+            def activate(box):
+                selection = box.curselection()
+                if not selection:
+                    self.status(self.tr("pick_function"))
+                    return
+                action, desc = MOUSE_ACTIONS[selection[0]]
+                self.pending = {"kind": "mouse", "action": action, "desc": desc}
+                self.write_pending()
+
+            _, self.mouse_list = self._list_page(MOUSE_ACTIONS, activate)
+
+        def _build_led_page(self):
+            def activate(box):
+                selection = box.curselection()
+                if not selection:
+                    self.status(self.tr("pick_function"))
+                    return
+                mode, desc = LED_MODES[selection[0]]
+                self.pending = {"kind": "led", "mode": mode, "desc": desc}
+                self.write_pending()
+
+            _, self.led_list = self._list_page(LED_MODES, activate)
+
+        def _build_osc_page(self):
+            frame = ttk.Frame(self.notebook)
+            self._add_page(frame)
+
+            host_row = ttk.Frame(frame)
+            host_row.pack(fill="x", padx=8, pady=(8, 4))
+            ttk.Label(host_row, text="Host:").pack(side="left")
+            self.osc_host = tk.StringVar(value=self.settings.get("osc", {}).get(
+                "host", "127.0.0.1"))
+            host_entry = ttk.Entry(host_row, textvariable=self.osc_host, width=16)
+            host_entry.pack(side="left", padx=(2, 8))
+            ttk.Label(host_row, text="Port:").pack(side="left")
+            self.osc_port = tk.StringVar(value=str(self.settings.get(
+                "osc", {}).get("port", 9000)))
+            port_entry = ttk.Entry(host_row, textvariable=self.osc_port, width=6)
+            port_entry.pack(side="left", padx=2)
+
+            self.user_vol_label = tk.Label(
+                frame, anchor="w",
+                text=self.settings.get("osc", {}).get(
+                    "user_volume_addr", "/avatar/parameters/UserVolume"))
+            self.user_vol_label.pack(fill="x", padx=8)
+
+            self.osc_hint = tk.Label(frame, anchor="w", justify="left",
+                                     wraplength=640)
+            self.osc_hint.pack(fill="x", padx=8, pady=(2, 4))
+
+            body = ttk.Frame(frame)
+            body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
             self.osc_rows = {}
-            for name, num in PHYS_KEYS:
-                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-                label = Gtk.Label(label=name)
-                label.set_size_request(56, -1)
-                row.append(label)
-                entry = Gtk.Entry(hexpand=True)
-                entry.set_text(self.settings.get("key_osc", {}).get(str(num), {}).get("addr", ""))
-                entry.connect("changed", self.on_osc_addr, num)
-                row.append(entry)
-                toggle = Gtk.ToggleButton(label="Tgl")
-                toggle.set_active(bool(self.settings.get("key_osc", {})
-                                       .get(str(num), {}).get("toggle", False)))
-                toggle.connect("toggled", self.on_osc_toggle, num)
-                row.append(toggle)
-                learn = Gtk.Button(label="...")
-                learn.set_tooltip_text("learn key code")
-                learn.connect("clicked", self.on_learn_key, num)
-                row.append(learn)
-                self.osc_rows[num] = (entry, toggle, learn)
-                table.append(row)
-            scroll.set_child(table)
-            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            outer_box.append(scroll)
-            self.pages["osc"] = outer_box
-            return outer_box, Gtk.Label()
+            for index, (name, num) in enumerate(PHYS_KEYS):
+                cfg = self.settings.get("key_osc", {}).get(str(num), {})
+                ttk.Label(body, text=name, width=7).grid(
+                    row=index, column=0, sticky="w", pady=1)
+                address = tk.StringVar(value=cfg.get("addr", ""))
+                ttk.Entry(body, textvariable=address).grid(
+                    row=index, column=1, sticky="we", padx=2, pady=1)
+                toggle = tk.BooleanVar(value=bool(cfg.get("toggle", False)))
+                ttk.Checkbutton(body, text="Tgl", variable=toggle).grid(
+                    row=index, column=2, pady=1)
+                ttk.Button(body, text="...", width=3,
+                           command=lambda n=num: self.on_learn_key(n)).grid(
+                    row=index, column=3, padx=2, pady=1)
+                self.osc_rows[num] = (address, toggle)
+                body.columnconfigure(1, weight=1)
 
-        def build_dial_page(self):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            box.set_margin_top(8)
-            box.set_margin_start(8)
-            box.set_margin_end(8)
-            self.dial_hint = Gtk.Label(xalign=0)
-            self.dial_hint.set_wrap(True)
-            box.append(self.dial_hint)
-            dial_cfg = self.settings.get("dial", {})
-            active = dial_cfg.get("modes", ["mic", "headphone", "user"])
+            self.osc_host.trace_add("write", lambda *_: self._save_osc_host())
+            self.osc_port.trace_add("write", lambda *_: self._save_osc_port())
+            for num, (address, _toggle) in self.osc_rows.items():
+                address.trace_add(
+                    "write", lambda *_n, n=num: self._save_osc_addr(n))
+                toggle.trace_add(
+                    "write", lambda *_n, n=num: self._save_osc_toggle(n))
+
+        def _build_dial_page(self):
+            frame = ttk.Frame(self.notebook)
+            self._add_page(frame)
+
+            self.dial_hint = tk.Label(frame, anchor="w", justify="left",
+                                      wraplength=640)
+            self.dial_hint.pack(fill="x", padx=8, pady=(8, 6))
+
+            active = self.settings.get("dial", {}).get(
+                "modes", ["mic", "headphone", "user"])
             self.dial_checks = {}
             for mode in DIAL_MODES:
-                check = Gtk.CheckButton(label=mode["ja"] + " / " + mode["en"])
-                check.set_active(mode["id"] in active)
-                check.connect("toggled", self.on_dial_mode, mode["id"])
-                self.dial_checks[mode["id"]] = check
-                box.append(check)
-            box.append(Gtk.Separator())
-            addr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            addr_row.append(Gtk.Label(label="User volume OSC:"))
-            self.user_vol_entry = Gtk.Entry(hexpand=True)
-            self.user_vol_entry.set_text(self.settings.get("osc", {}).get(
-                "user_volume_addr", "/avatar/parameters/UserVolume"))
-            self.user_vol_entry.connect("changed", self.on_user_vol_addr)
-            addr_row.append(self.user_vol_entry)
-            box.append(addr_row)
-            learn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            self.learn_rotate_btn = Gtk.Button()
-            self.learn_rotate_btn.connect("clicked", self.on_learn_rotate)
-            learn_row.append(self.learn_rotate_btn)
-            self.learn_push_btn = Gtk.Button()
-            self.learn_push_btn.connect("clicked", self.on_learn_push)
-            learn_row.append(self.learn_push_btn)
-            box.append(learn_row)
-            self.dial_state = Gtk.Label(xalign=0)
-            box.append(self.dial_state)
-            self.mon_btn = Gtk.Button()
-            self.mon_btn.connect("clicked", self.on_monitor_toggle)
-            box.append(self.mon_btn)
-            self.pages["dial"] = box
-            return box, Gtk.Label()
+                var = tk.BooleanVar(value=mode["id"] in active)
+                ttk.Checkbutton(
+                    frame, text=mode["ja"] + " / " + mode["en"], variable=var,
+                    command=lambda m=mode["id"]: self.on_dial_mode(m)).pack(
+                    anchor="w", padx=8)
+                self.dial_checks[mode["id"]] = var
 
-        def build_about_page(self):
-            label = Gtk.Label(xalign=0, justify=Gtk.Justification.LEFT)
-            label.set_wrap(True)
-            label.set_margin_top(12)
-            label.set_margin_start(12)
-            self.about_label = label
-            self.pages["about"] = label
-            return label, Gtk.Label()
+            ttk.Separator(frame).pack(fill="x", padx=8, pady=8)
+
+            addr_row = ttk.Frame(frame)
+            addr_row.pack(fill="x", padx=8)
+            ttk.Label(addr_row, text="User volume OSC:").pack(side="left")
+            self.user_vol_entry = tk.StringVar(value=self.settings.get("osc", {}).get(
+                "user_volume_addr", "/avatar/parameters/UserVolume"))
+            ttk.Entry(addr_row, textvariable=self.user_vol_entry).pack(
+                side="left", fill="x", expand=True, padx=4)
+            self.user_vol_entry.trace_add("write", lambda *_: self._save_user_vol())
+
+            learn_row = ttk.Frame(frame)
+            learn_row.pack(fill="x", padx=8, pady=8)
+            self.learn_rotate_btn = ttk.Button(
+                learn_row, text=self.tr("learn_rotate"), command=self.on_learn_rotate)
+            self.learn_rotate_btn.pack(side="left")
+            self.learn_push_btn = ttk.Button(
+                learn_row, text=self.tr("learn_push"), command=self.on_learn_push)
+            self.learn_push_btn.pack(side="left", padx=6)
+
+            self.dial_state = tk.Label(frame, anchor="w", text="")
+            self.dial_state.pack(fill="x", padx=8)
+
+            self.mon_btn = ttk.Button(frame, text=self.tr("start_monitor"),
+                                      command=self.on_monitor_toggle)
+            self.mon_btn.pack(fill="x", padx=8, pady=(10, 8))
+
+        def _build_about_page(self):
+            frame = ttk.Frame(self.notebook)
+            self.about_text = tk.Text(frame, wrap="word", relief="flat",
+                                      padx=10, pady=10)
+            self.about_text.pack(fill="both", expand=True)
+            self.about_text.configure(state="disabled")
+            self._add_page(frame)
 
         # -- helpers -------------------------------------------------------
         def tr(self, key):
             return I18N[self.lang].get(key, I18N["en"].get(key, key))
 
-        def on_toggle_lang(self, _btn):
+        def status(self, message):
+            self.toast.configure(text=message)
+
+        def on_toggle_lang(self):
             self.lang = "en" if self.lang == "ja" else "ja"
             self.settings["lang"] = self.lang
             save_settings(self.settings)
             self.apply_lang()
 
         def apply_lang(self):
-            t = I18N[self.lang]
-            self.set_title(t["app"])
-            self.title_label.set_text(t["app"])
-            self.lang_btn.set_label("JA" if self.lang == "en" else "EN")
-            self.key_label.set_markup("<b>%s</b>" % t["selected"])
-            self.assign_label.set_markup("<b>%s</b>" % t["current"])
-            self.clear_btn.set_label(t["clear"])
-            self.dl_btn.set_label(t["download"])
-            self.disable_btn.set_label(t["disable_key"])
-            self.layer_label.set_text(t["layer"])
-            self.layer_dd.set_selected(self.layer - 1)
-            self.osc_hint.set_text(t["osc_hint"])
-            self.dial_hint.set_text(t["dial_hint"])
-            self.learn_rotate_btn.set_label(t["learn_rotate"])
-            self.learn_push_btn.set_label(t["learn_push"])
-            self.about_label.set_text(t["about_text"])
-            page_keys = ["page_key", "page_fun", "page_media", "page_mouse",
-                         "page_led", "page_osc", "page_dial", "page_about"]
-            for index, key in enumerate(page_keys):
-                child = self.notebook.get_nth_page(index)
-                self.notebook.set_tab_label(child, Gtk.Label(label=t[key]))
-            self.update_monitor_button()
+            self._updating = True
+            try:
+                t = I18N[self.lang]
+                self.root.title(t["app"])
+                self.lang_btn.configure(text="JA" if self.lang == "en" else "EN")
+                self.key_label.configure(text=t["selected"])
+                self.clear_btn.configure(text=t["clear"])
+                self.dl_btn.configure(text=t["download"])
+                self.disable_btn.configure(text=t["disable_key"])
+                self.layer_label.configure(text=t["layer"])
+                self.osc_hint.configure(text=t["osc_hint"])
+                self.dial_hint.configure(text=t["dial_hint"])
+                self.learn_rotate_btn.configure(text=t["learn_rotate"])
+                self.learn_push_btn.configure(text=t["learn_push"])
+                self.about_text.configure(state="normal")
+                self.about_text.delete("1.0", "end")
+                self.about_text.insert("1.0", t["help_text"] + "\n\n" + t["about_text"])
+                self.about_text.configure(state="disabled")
+                page_keys = ["page_key", "page_fun", "page_media", "page_mouse",
+                             "page_led", "page_osc", "page_dial", "page_about"]
+                for index, key in enumerate(page_keys):
+                    self.notebook.tab(self.pages[index], text=t[key])
+                self.refresh_assignment()
+            finally:
+                self._updating = False
             self.update_conn_ui(self._last_conn)
-            self.refresh_assignment()
+            self.update_monitor_button()
 
         def update_conn_ui(self, connected):
             self._last_conn = connected
             if connected:
-                self.status_dot.add_css_class("success")
-                self.status_dot.remove_css_class("error")
+                self.status_dot.configure(fg="green")
                 text = self.tr("connected")
-                color = "green"
             else:
-                self.status_dot.remove_css_class("success")
-                self.status_dot.add_css_class("error")
+                self.status_dot.configure(fg="red")
                 text = self.tr("disconnected")
-                color = "red"
-            self.status_txt.set_markup('<span foreground="%s">%s</span>' % (color, text))
+            self.status_txt.configure(text=text)
 
         def tick_connect(self):
             if not self.dev.is_open():
@@ -1401,36 +2599,38 @@ def run_gui():
                     self._last_error = self.dev.last_error
                     if not self._tried_permission:
                         self._tried_permission = True
-                        self.toast.set_text(str(exc))
+                        self.status(str(exc))
                 except Exception as exc:
                     ok = False
                     if str(exc) != self._last_error:
                         self._last_error = str(exc)
-                        self.toast.set_text(str(exc))
+                        self.status(str(exc))
                 if ok:
                     self._last_error = None
                     if self.report_layer_needed():
                         self.dev.switch_layer(self.layer)
                 elif self.dev.last_error and self.dev.last_error != self._last_error:
                     self._last_error = self.dev.last_error
-                    self.toast.set_text(self.dev.last_error)
+                    self.status(self.dev.last_error)
                 self.update_conn_ui(ok)
             else:
                 self.update_conn_ui(True)
             self.update_monitor_button()
-            return True
+            self.root.after(1000, self.tick_connect)
 
         def report_layer_needed(self):
             return self.dev.report_id != 0
 
-        def status(self, message):
-            self.toast.set_text(message)
-
         def current_layer(self):
             return self.layer
 
-        def on_layer_changed(self, dropdown, _pspec):
-            selected = dropdown.get_selected() + 1
+        def on_layer_changed(self, _event=None):
+            if self._updating:
+                return
+            try:
+                selected = int(self.layer_var.get())
+            except ValueError:
+                return
             if selected == self.layer:
                 return
             self.layer = selected
@@ -1444,14 +2644,14 @@ def run_gui():
             layer_key = str(self.layer)
             store = self.settings.get("assignments", {}).get(layer_key, {})
             if self.selected_key is None:
-                self.assign_label.set_markup(
-                    "<b>%s</b>: %s" % (self.tr("current"), self.tr("no_key")))
+                self.assign_label.configure(
+                    text="%s: %s" % (self.tr("current"), self.tr("no_key")))
                 return
             value = store.get(str(self.selected_key))
             name = dict(PHYS_KEYS).get(self.selected_key, str(self.selected_key))
-            self.assign_label.set_markup(
-                "<b>%s</b> [%s]: %s" % (self.tr("current"), name,
-                                        value or self.tr("assign_empty")))
+            self.assign_label.configure(
+                text="%s [%s]: %s" % (self.tr("current"), name,
+                                      value or self.tr("assign_empty")))
 
         def remember(self, description):
             store = self.settings.setdefault("assignments", {}).setdefault(
@@ -1461,20 +2661,23 @@ def run_gui():
             save_settings(self.settings)
             self.refresh_assignment()
 
-        # -- key selection -------------------------------------------------
-        def on_pick_key(self, button, num):
+        # -- key selection --------------------------------------------------
+        def on_pick_key(self, num):
             self.selected_key = num
-            for widget in self.key_buttons.values():
-                widget.remove_css_class("destructive-action")
-            button.add_css_class("destructive-action")
+            for number, button in self.key_buttons.items():
+                button.configure(
+                    relief="sunken" if number == num else "raised",
+                    bg="#ffcccc" if number == num
+                    else getattr(self, "_key_bg", "lightgrey"))
             self.refresh_assignment()
 
-        def on_clear(self, _btn):
+        def on_clear(self):
             self.selected_key = None
             self.pending = None
-            self.toast.set_text("")
-            for widget in self.key_buttons.values():
-                widget.remove_css_class("destructive-action")
+            self.status("")
+            for button in self.key_buttons.values():
+                button.configure(relief="raised",
+                                 bg=getattr(self, "_key_bg", "lightgrey"))
             self.refresh_assignment()
 
         def require_key(self):
@@ -1486,67 +2689,37 @@ def run_gui():
                 return False
             return True
 
-        # -- pages handlers ------------------------------------------------
-        def on_basic_activated(self, _box, row):
-            if row is None:
-                return
-            self.pending = {"kind": "key", "desc": row.get_child().get_text(),
-                            "keys": [(0, row.usage)], "lone_mod": 0}
-            self.write_pending()
-
-        def on_media_activated(self, _box, row):
-            if row is None:
-                return
-            self.pending = {"kind": "media", "action": row.action, "desc": row.desc}
-            self.write_pending()
-
-        def on_mouse_activated(self, _box, row):
-            if row is None:
-                return
-            self.pending = {"kind": "mouse", "action": row.action, "desc": row.desc}
-            self.write_pending()
-
-        def on_led_activated(self, _box, row):
-            if row is None:
-                return
-            self.pending = {"kind": "led", "mode": row.mode, "desc": row.desc}
-            self.write_pending()
-
-        def on_add_group(self, _btn):
+        # -- page handlers --------------------------------------------------
+        def on_add_group(self):
             mods = 0
-            for mask, check in self.mod_checks.items():
-                if check.get_active():
+            for mask, var in self.mod_checks.items():
+                if var.get():
                     mods |= mask
-            index = self.base_dd.get_selected()
+            try:
+                index = [n for n, _ in self.base_dd["values"]].index(
+                    self.base_var.get())
+            except ValueError:
+                index = 0
             if index == 0:
                 self.groups = []
             elif len(self.groups) < 5:
                 self.groups.append((mods, USAGE_KEYS[index - 1][1]))
             self.render_groups()
 
-        def on_reset_groups(self, _btn):
+        def on_reset_groups(self):
             self.groups = []
-            self.group_mod = 0
-            for check in self.mod_checks.values():
-                check.set_active(False)
-            self.base_dd.set_selected(0)
+            for var in self.mod_checks.values():
+                var.set(False)
+            self.base_var.set("(modifier only) / 修飾のみ")
             self.render_groups()
 
         def render_groups(self):
-            while True:
-                child = self.groups_list.get_first_child()
-                if child is None:
-                    break
-                self.groups_list.remove(child)
+            self.groups_list.delete(0, "end")
             if not self.groups:
-                row = Gtk.ListBoxRow()
-                row.set_child(Gtk.Label(label=self.tr("assign_empty"), xalign=0))
-                self.groups_list.append(row)
+                self.groups_list.insert("end", self.tr("assign_empty"))
                 return
             for mods, usage in self.groups:
-                row = Gtk.ListBoxRow()
-                row.set_child(Gtk.Label(label=self.describe(mods, usage), xalign=0))
-                self.groups_list.append(row)
+                self.groups_list.insert("end", self.describe(mods, usage))
 
         @staticmethod
         def describe(mods, usage):
@@ -1560,10 +2733,14 @@ def run_gui():
 
         def build_pending_from_groups(self):
             mods = 0
-            for mask, check in self.mod_checks.items():
-                if check.get_active():
+            for mask, var in self.mod_checks.items():
+                if var.get():
                     mods |= mask
-            index = self.base_dd.get_selected()
+            try:
+                index = [n for n, _ in self.base_dd["values"]].index(
+                    self.base_var.get())
+            except ValueError:
+                index = 0
             if index == 0:
                 keys = []
                 lone = mods
@@ -1573,38 +2750,46 @@ def run_gui():
                 if not keys:
                     keys = [(mods, USAGE_KEYS[index - 1][1])]
                 lone = keys[0][0]
-                desc = " / ".join(self.describe(gmod, gusage) for gmod, gusage in keys)
+                desc = " / ".join(self.describe(gmod, gusage)
+                                  for gmod, gusage in keys)
             return {"kind": "key", "desc": desc, "keys": keys, "lone_mod": lone}
 
-        def on_download(self, _btn):
-            page = self.notebook.get_current_page()
+        def _selected(self, box):
+            selection = box.curselection()
+            return selection[0] if selection else None
+
+        def on_download(self):
+            page = self.notebook.index(self.notebook.select())
             if page == 0:
-                row = self.basic_list.get_selected_row()
-                if row is None:
+                index = self._selected(self.basic_list)
+                if index is None:
                     self.status(self.tr("pick_function"))
                     return
-                self.pending = {"kind": "key", "desc": row.get_child().get_text(),
-                                "keys": [(0, row.usage)], "lone_mod": 0}
+                self.pending = {"kind": "key", "desc": USAGE_KEYS[index][0],
+                                "keys": [(0, USAGE_KEYS[index][1])], "lone_mod": 0}
             elif page == 1:
                 self.pending = self.build_pending_from_groups()
             elif page == 2:
-                row = self.notebook.get_nth_page(2).get_selected_row()
-                if row is None:
+                index = self._selected(self.media_list)
+                if index is None:
                     self.status(self.tr("pick_function"))
                     return
-                self.pending = {"kind": "media", "action": row.action, "desc": row.desc}
+                action, desc = MEDIA_ACTIONS[index]
+                self.pending = {"kind": "media", "action": action, "desc": desc}
             elif page == 3:
-                row = self.notebook.get_nth_page(3).get_selected_row()
-                if row is None:
+                index = self._selected(self.mouse_list)
+                if index is None:
                     self.status(self.tr("pick_function"))
                     return
-                self.pending = {"kind": "mouse", "action": row.action, "desc": row.desc}
+                action, desc = MOUSE_ACTIONS[index]
+                self.pending = {"kind": "mouse", "action": action, "desc": desc}
             elif page == 4:
-                row = self.led_list.get_selected_row()
-                if row is None:
+                index = self._selected(self.led_list)
+                if index is None:
                     self.status(self.tr("pick_function"))
                     return
-                self.pending = {"kind": "led", "mode": row.mode, "desc": row.desc}
+                mode, desc = LED_MODES[index]
+                self.pending = {"kind": "led", "mode": mode, "desc": desc}
             if self.pending is None:
                 self.status(self.tr("pick_function"))
                 return
@@ -1626,18 +2811,21 @@ def run_gui():
                 layer = self.current_layer()
                 if pending["kind"] == "key":
                     ok = self.dev.write_key(self.selected_key, layer,
-                                            pending["keys"], pending.get("lone_mod", 0))
+                                            pending["keys"],
+                                            pending.get("lone_mod", 0))
                 elif pending["kind"] == "media":
-                    ok = self.dev.write_media(self.selected_key, layer, pending["action"])
+                    ok = self.dev.write_media(self.selected_key, layer,
+                                              pending["action"])
                 else:
-                    ok = self.dev.write_mouse(self.selected_key, layer, pending["action"])
+                    ok = self.dev.write_mouse(self.selected_key, layer,
+                                              pending["action"])
             if ok:
                 self.remember(pending["desc"])
                 self.status("%s (%s)" % (self.tr("download_ok"), pending["desc"]))
             else:
                 self.status(self.tr("download_ng"))
 
-        def on_disable(self, _btn):
+        def on_disable(self):
             if not self.require_key():
                 return
             ok = self.dev.write_key(self.selected_key, self.current_layer(), [], 0)
@@ -1647,54 +2835,68 @@ def run_gui():
             else:
                 self.status(self.tr("download_ng"))
 
-        def on_help(self, _btn):
-            dialog = Adw.MessageDialog(transient_for=self, modal=True)
-            dialog.set_heading(self.tr("help_title"))
-            dialog.set_body(self.tr("help_text"))
-            dialog.add_response("ok", "OK")
-            dialog.present()
+        def on_help(self):
+            messagebox.showinfo(self.tr("help_title"), self.tr("help_text"),
+                                parent=self.root)
 
-        # -- OSC -----------------------------------------------------------
-        def on_osc_host(self, entry):
-            self.settings.setdefault("osc", {})["host"] = entry.get_text().strip()
+        # -- OSC ------------------------------------------------------------
+        def _save_osc_host(self):
+            if self._updating:
+                return
+            self.settings.setdefault("osc", {})["host"] = self.osc_host.get().strip()
             save_settings(self.settings)
 
-        def on_osc_port(self, entry):
+        def _save_osc_port(self):
+            if self._updating:
+                return
             try:
-                self.settings.setdefault("osc", {})["port"] = int(entry.get_text().strip())
+                self.settings.setdefault("osc", {})["port"] = int(
+                    self.osc_port.get().strip())
                 save_settings(self.settings)
             except ValueError:
                 pass
 
-        def on_user_vol_addr(self, entry):
-            self.settings.setdefault("osc", {})["user_volume_addr"] = entry.get_text().strip()
+        def _save_user_vol(self):
+            if self._updating:
+                return
+            value = self.user_vol_entry.get().strip()
+            self.settings.setdefault("osc", {})["user_volume_addr"] = value
+            self.user_vol_label.configure(text=value)
             save_settings(self.settings)
 
-        def on_osc_addr(self, entry, num):
+        def _save_osc_toggle(self, num):
+            if self._updating:
+                return
+            _address, toggle = self.osc_rows[num]
             cfg = self.settings.setdefault("key_osc", {}).setdefault(
                 str(num), {"addr": "", "toggle": False, "code": None})
-            cfg["addr"] = entry.get_text().strip()
+            cfg["toggle"] = bool(toggle.get())
             save_settings(self.settings)
 
-        def on_osc_toggle(self, button, num):
+        def _save_osc_addr(self, num):
+            if self._updating:
+                return
+            address, _toggle = self.osc_rows[num]
             cfg = self.settings.setdefault("key_osc", {}).setdefault(
                 str(num), {"addr": "", "toggle": False, "code": None})
-            cfg["toggle"] = button.get_active()
+            cfg["addr"] = address.get().strip()
             save_settings(self.settings)
 
-        def on_dial_mode(self, button, mode_id):
+        def on_dial_mode(self, mode_id):
+            if self._updating:
+                return
             dial = self.settings.setdefault("dial", {})
             current = set(dial.get("modes", ["mic", "headphone", "user"]))
-            if button.get_active():
+            if self.dial_checks[mode_id].get():
                 current.add(mode_id)
             else:
                 current.discard(mode_id)
             dial["modes"] = [m["id"] for m in DIAL_MODES if m["id"] in current]
             save_settings(self.settings)
 
-        # -- learning ------------------------------------------------------
-        def start_learn(self, label, seconds, callback, want_key=True, want_rel=False,
-                        ignore=()):
+        # -- learning -------------------------------------------------------
+        def start_learn(self, label, seconds, callback, want_key=True,
+                        want_rel=False, ignore=()):
             if self._learn is not None and not self._learn.done:
                 return
             self.status(label)
@@ -1702,20 +2904,19 @@ def run_gui():
                                  ignore=ignore)
             self._learn = thread
             thread.start()
-            from gi.repository import GLib as _GLib
+            self._poll_learn(thread, callback)
 
-            def poll():
-                if not thread.done:
-                    return True
-                if thread.result:
-                    callback(thread.result[0], thread.result[1])
-                else:
-                    self.status(self.tr("learn_fail"))
-                self._learn = None
-                return False
-            _GLib.timeout_add(200, poll)
+        def _poll_learn(self, thread, callback):
+            if not thread.done:
+                self.root.after(200, lambda: self._poll_learn(thread, callback))
+                return
+            if thread.result:
+                callback(thread.result[0], thread.result[1])
+            else:
+                self.status(self.tr("learn_fail"))
+            self._learn = None
 
-        def on_learn_key(self, _btn, num):
+        def _ignore_codes(self):
             ignore = set()
             for code_cfg in self.settings.get("key_osc", {}).values():
                 if code_cfg.get("code"):
@@ -1723,55 +2924,55 @@ def run_gui():
             push = self.settings.get("dial", {}).get("push_code")
             if push:
                 ignore.add(int(push))
+            return ignore
 
+        def on_learn_key(self, num):
             def done(_kind, code):
                 cfg = self.settings.setdefault("key_osc", {}).setdefault(
                     str(num), {"addr": "", "toggle": False, "code": None})
                 cfg["code"] = code
                 save_settings(self.settings)
                 self.status("%s: %d" % (self.tr("learn_done"), code))
-            self.start_learn(self.tr("learning"), 5, done, ignore=ignore)
 
-        def on_learn_rotate(self, _btn):
+            self.start_learn(self.tr("learning"), 5, done,
+                             ignore=self._ignore_codes())
+
+        def on_learn_rotate(self):
             def done(_kind, code):
                 self.settings.setdefault("dial", {})["rotate_codes"] = [code]
                 save_settings(self.settings)
                 self.refresh_dial_state()
                 self.status("%s: %d" % (self.tr("learn_done"), code))
-            self.start_learn(self.tr("learning"), 6, done, want_key=False, want_rel=True)
 
-        def on_learn_push(self, _btn):
-            ignore = set()
-            for code_cfg in self.settings.get("key_osc", {}).values():
-                if code_cfg.get("code"):
-                    ignore.add(int(code_cfg["code"]))
+            self.start_learn(self.tr("learning"), 6, done,
+                             want_key=False, want_rel=True)
 
+        def on_learn_push(self):
             def done(_kind, code):
                 self.settings.setdefault("dial", {})["push_code"] = code
                 save_settings(self.settings)
                 self.refresh_dial_state()
                 self.status("%s: %d" % (self.tr("learn_done"), code))
-            self.start_learn(self.tr("learning"), 6, done, ignore=ignore)
+
+            self.start_learn(self.tr("learning"), 6, done,
+                             ignore=self._ignore_codes())
 
         def refresh_dial_state(self):
             dial = self.settings.get("dial", {})
             rotate = dial.get("rotate_codes") or list(DIAL_DEFAULT_CODES)
             push = dial.get("push_code")
-            self.dial_state.set_text("rotate=%s  push=%s" % (rotate, push))
+            self.dial_state.configure(text="rotate=%s  push=%s" % (rotate, push))
 
-        # -- monitor -------------------------------------------------------
+        # -- monitor --------------------------------------------------------
         def update_monitor_button(self):
             running = monitor_is_running()
-            self.mon_btn.set_label(self.tr("stop_monitor") if running
-                                   else self.tr("start_monitor"))
-            for css in ("suggested-action", "destructive-action"):
-                self.mon_btn.remove_css_class(css)
-            self.mon_btn.add_css_class("destructive-action" if running
-                                       else "suggested-action")
+            self.mon_btn.configure(
+                text=self.tr("stop_monitor") if running
+                else self.tr("start_monitor"))
             if hasattr(self, "dial_state"):
                 self.refresh_dial_state()
 
-        def on_monitor_toggle(self, _btn):
+        def on_monitor_toggle(self):
             if monitor_is_running():
                 stop_monitor_process()
                 self.status(self.tr("monitor_stopped"))
@@ -1781,16 +2982,10 @@ def run_gui():
                             if not ok else self.tr("monitor_running"))
             self.update_monitor_button()
 
-    class Application(Adw.Application):
-        def __init__(self):
-            super().__init__(application_id="io.github.t1kb.config")
-
-        def do_activate(self):
-            window = MainWindow(self)
-            window.present()
-
-    app = Application()
-    return app.run(None)
+    root = tk.Tk()
+    MainWindow(root)
+    root.mainloop()
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1801,22 +2996,29 @@ INPUT_CODES = "/usr/include/linux/input-event-codes.h"
 
 
 def load_input_names():
+    """{(evtype, code): name}, preferring the kernel header when present."""
     names = {}
     try:
         lines = open(INPUT_CODES, encoding="utf-8", errors="replace")
     except OSError:
-        return names
-    pattern = re.compile(r"^\s*#define\s+((?:KEY|BTN|REL|ABS)_[A-Z0-9_]+)\s+(\d+)")
-    with lines:
-        for line in lines:
-            match = pattern.match(line)
-            if match:
-                names.setdefault(int(match.group(2)), match.group(1))
+        lines = None
+    if lines is not None:
+        pattern = re.compile(r"^\s*#define\s+((?:KEY|BTN|REL|ABS)_[A-Z0-9_]+)\s+(\d+)")
+        with lines:
+            for line in lines:
+                match = pattern.match(line)
+                if match:
+                    name = match.group(1)
+                    etype = (EV_REL if name.startswith("REL_") else
+                             3 if name.startswith("ABS_") else EV_KEY)
+                    names.setdefault((etype, int(match.group(2))), name)
+    for key, name in EVDEV_KEY_NAMES.items():
+        names.setdefault(key, name)
     return names
 
 
 def event_names(names, etype, code):
-    label = names.get(code)
+    label = names.get((etype, code))
     if label is None:
         label = "0x%03x" % code
     kind = {EV_KEY: "KEY", EV_REL: "REL", 3: "ABS", 4: "MSC"}.get(
@@ -1825,50 +3027,43 @@ def event_names(names, etype, code):
 
 
 def run_watch(seconds=None):
-    nodes = t1_input_nodes()
-    if not nodes:
-        print("no readable T1 input node - check the udev rule", file=sys.stderr)
-        return 1
-    fds = open_input_nodes()
-    if not fds:
-        print("cannot open %s" % ", ".join(path for _, path in nodes), file=sys.stderr)
+    source = open_input_source()
+    if source is None:
+        print("no readable T1 input node - check the udev rule / permissions",
+              file=sys.stderr)
         return 1
     names = load_input_names()
-    paths = dict(fds)
-    print("watching: %s" % ", ".join(os.path.basename(path) for _, path in fds))
+    print("watching: %s" % source.describe())
     print("press a key or turn the dial (Ctrl-C to stop)")
     deadline = time.time() + seconds if seconds else None
     try:
         while deadline is None or time.time() < deadline:
             try:
-                ready, _, _ = select.select([fd for fd, _ in fds], [], [], 0.5)
+                events = source.wait(0.5)
             except (OSError, ValueError):
                 break
-            for fd in ready:
-                for etype, code, value in read_events(fd):
-                    if etype == EV_SYN:
-                        continue
-                    kind, label = event_names(names, etype, code)
-                    if etype == EV_KEY:
-                        state = "down" if value == 1 else ("up" if value == 0 else "repeat")
-                    else:
-                        state = "%+d" % value
-                    print("  %-9s %-4s %-18s %s" % (
-                        os.path.basename(paths[fd]), kind, label, state))
-                    sys.stdout.flush()
+            for etype, code, value in events:
+                if etype == EV_SYN:
+                    continue
+                kind, label = event_names(names, etype, code)
+                if etype == EV_KEY:
+                    state = "down" if value == 1 else ("up" if value == 0 else "repeat")
+                else:
+                    state = "%+d" % value
+                print("  %-9s %-4s %-18s %s" % (
+                    source.name, kind, label, state))
+                sys.stdout.flush()
     except KeyboardInterrupt:
         pass
-    for fd, _ in fds:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    finally:
+        source.close()
     return 0
 
 
 # ---------------------------------------------------------------------------
 # self test
 # ---------------------------------------------------------------------------
+
 
 def selftest(write=False, verbose=True):
     results = []
@@ -1879,69 +3074,82 @@ def selftest(write=False, verbose=True):
             print("%-28s %s%s" % (name, "OK  " if ok else "FAIL",
                                   (" - " + detail) if detail else ""))
 
-    rule_ok = os.path.exists(UDEV_RULE)
-    check("udev rule installed", rule_ok, UDEV_RULE if rule_ok else
-          "run: sudo ./install.sh")
+    check("platform", True, "%s / python %s" % (sys.platform, platform.python_version()))
 
-    node = usb_node_path()
-    check("usb device present", node is not None, node or "1189:8890 not found")
+    node = None
+    if IS_LINUX:
+        rule_ok = os.path.exists(UDEV_RULE)
+        check("udev rule installed", rule_ok, UDEV_RULE if rule_ok else
+              "run: sudo ./install.sh")
+        node = usb_node_path()
+        check("usb device present", node is not None, node or "1189:8890 not found")
+        if node:
+            try:
+                opened = os.open(node, os.O_RDWR)
+                os.close(opened)
+                check("usb node permission", True, node)
+            except OSError as exc:
+                check("usb node permission", False, str(exc))
 
     device = T1Device()
-    if node:
-        try:
-            opened = os.open(node, os.O_RDWR)
-            os.close(opened)
-            check("usb node permission", True, node)
-        except OSError as exc:
-            check("usb node permission", False, str(exc))
-
     connected = False
-    if node:
+    if IS_LINUX and not node:
+        check("config interface", False, "device not present")
+    else:
         try:
             connected = device.connect()
-            detail = ""
-            if not connected:
-                detail = device.last_error or ""
-            check("config interface (usbfs)", connected, detail)
+            detail = "" if connected else (device.last_error or "")
+            check("config interface", connected, detail)
         except DeviceError as exc:
-            check("config interface (usbfs)", False, str(exc).splitlines()[0])
+            check("config interface", False, str(exc).splitlines()[0])
 
     if connected:
         check("report id detected", True,
               "id=%d data=%d bytes frame=%d" % (
                   device.report_id, device.data_len,
                   1 + device.data_len if device.had_report_id else device.data_len))
-        check("write path", True, "urb_type=%s" %
-              ("interrupt" if device._urb_type == USBDEVFS_URB_TYPE_INTERRUPT else
-               "bulk" if device._urb_type == USBDEVFS_URB_TYPE_BULK else "control"))
+        if device.transport_kind == "usbfs":
+            detail = "urb_type=%s" % (
+                "interrupt" if device._urb_type == USBDEVFS_URB_TYPE_INTERRUPT else
+                "bulk" if device._urb_type == USBDEVFS_URB_TYPE_BULK else "control")
+        else:
+            detail = "hid output report (%s)" % device.node
+        check("write path", True, detail)
         if write:
             ok = device.switch_layer(1) and device.write_payload(flash_report())
             check("test write (layer+flash)", ok, "" if ok else "failed")
 
-    hidraw = sorted(glob.glob("/dev/hidraw*"))
-    readable = []
-    for path in hidraw:
-        try:
-            handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            os.close(handle)
-            readable.append(os.path.basename(path))
-        except OSError:
-            pass
-    check("hidraw readable", bool(hidraw) and len(readable) == len(hidraw),
-          "%d/%d" % (len(readable), len(hidraw)))
+    if IS_LINUX:
+        hidraw = sorted(glob.glob("/dev/hidraw*"))
+        readable = []
+        for path in hidraw:
+            try:
+                handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                os.close(handle)
+                readable.append(os.path.basename(path))
+            except OSError:
+                pass
+        check("hidraw readable", bool(hidraw) and len(readable) == len(hidraw),
+              "%d/%d" % (len(readable), len(hidraw)))
 
-    nodes = t1_input_nodes()
-    ev_readable = []
-    for path, _name in nodes:
-        try:
-            handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            os.close(handle)
-            ev_readable.append(os.path.basename(path))
-        except OSError:
-            pass
-    check("input events readable", bool(nodes) and len(ev_readable) == len(nodes),
-          "%d/%d of %s" % (len(ev_readable), len(nodes),
-                           ",".join(os.path.basename(p) for p, _ in nodes)))
+        nodes = t1_input_nodes()
+        ev_readable = []
+        for path, _name in nodes:
+            try:
+                handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                os.close(handle)
+                ev_readable.append(os.path.basename(path))
+            except OSError:
+                pass
+        check("input events readable", bool(nodes) and len(ev_readable) == len(nodes),
+              "%d/%d of %s" % (len(ev_readable), len(nodes),
+                               ",".join(os.path.basename(p) for p, _ in nodes)))
+    else:
+        source = open_input_source()
+        check("input events readable", source is not None,
+              source.describe() if source else "backend unavailable")
+        if source is not None:
+            source.close()
 
     device.close()
     passed = all(ok for _, ok, _ in results)
@@ -1957,7 +3165,7 @@ def selftest(write=False, verbose=True):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="T1 mini keyboard configuration tool for Linux")
+        description="T1 mini keyboard configuration tool (Linux / Windows / macOS)")
     parser.add_argument("--version", action="version", version="%s %s" % (APP_NAME, VERSION))
     parser.add_argument("--monitor", action="store_true",
                         help="run the dial/OSC monitor daemon in the foreground")
