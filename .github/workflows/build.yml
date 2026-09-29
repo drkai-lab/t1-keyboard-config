@@ -1,0 +1,140 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux (lint, tests, tarball)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tooling
+        run: pip install ruff
+      - name: Lint
+        run: ruff check .
+      - name: Tests
+        run: |
+          python3 tests/test_protocol.py
+          python3 tests/test_monitor.py
+          python3 tests/test_platform.py
+      - name: CLI smoke test
+        run: |
+          ./t1-keyboard-config --version
+          ./t1-keyboard-config --help > /dev/null
+      - name: Self test (informational, no device on a runner)
+        run: ./t1-keyboard-config --selftest || true
+      - name: Tarball
+        run: ./build-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: dist/t1-keyboard-linux-*.tar.gz*
+          if-no-files-found: error
+
+  windows:
+    name: windows (.exe)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Tests
+        run: |
+          python3 tests/test_protocol.py
+          python3 tests/test_platform.py
+      - name: Build console exe
+        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config --distpath ../dist-win linux/t1-keyboard-config
+      - name: Build windowed (GUI) exe
+        run: pyinstaller --noconfirm --onefile --windowed --name t1-keyboard-config-gui --distpath ../dist-win linux/t1-keyboard-config
+      - name: Launch smoke test
+        run: |
+          ../dist-win/t1-keyboard-config.exe --version
+          ../dist-win/t1-keyboard-config.exe --help > /dev/null
+          ../dist-win/t1-keyboard-config-gui.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist-win/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macos (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    defaults:
+      run:
+        shell: bash
+        working-directory: linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Tests
+        run: |
+          python3 tests/test_protocol.py
+          python3 tests/test_platform.py
+      - name: Build the .app bundle
+        run: pyinstaller --noconfirm --onedir --windowed --name "T1 Keyboard Config" --distpath ../dist-mac linux/t1-keyboard-config
+      - name: Build the CLI binary
+        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config-cli --distpath ../dist-mac linux/t1-keyboard-config
+      - name: Launch smoke test
+        run: |
+          ../dist-mac/t1-keyboard-config-cli --version
+          "../dist-mac/T1 Keyboard Config.app/Contents/MacOS/T1 Keyboard Config" --version
+      - name: Package the .app (symlink preserving)
+        run: |
+          ditto -c -k --keepParent "../dist-mac/T1 Keyboard Config.app" \
+            "../dist-mac/T1-Keyboard-Config-${{ matrix.arch }}.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist-mac/*.app.zip
+            dist-mac/t1-keyboard-config-cli
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes out/*

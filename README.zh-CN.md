@@ -1,7 +1,8 @@
 # T1 Keyboard Config
 
-T1 迷你键盘(USB VID `1189` / PID `8890`)的**跨平台配置工具**。
-我们逆向了厂商的 Windows 版 `MINI KeyBoard.exe`，并用 **Tkinter（仅标准库）**
+T1 迷你键盘（USB VID `1189` / PID `8890`，即 AliExpress 上的
+[「6键 1旋钮 RGB 可编程宏游戏旋钮小键盘 迷你自定义编程键盘 Photoshop 用 USB 机械键盘」](https://ja.aliexpress.com/item/1005009812219099.html)）
+的**跨平台配置工具**。我们逆向了厂商的 Windows 版 `MINI KeyBoard.exe`，并用 **Tkinter（仅标准库）**
 重写为单文件 Python 应用，无任何运行时依赖。
 
 [English](README.md) | [日本語](README.ja.md) | 简体中文 | [한국어](README.ko.md)
@@ -94,9 +95,8 @@ python3 t1-keyboard-config
 ln -s "$(pwd)/t1-keyboard-config" /usr/local/bin/t1-keyboard-config
 ```
 
-> **为什么没有 `.exe` / `.app`**：本开发环境只有 Linux，因此 Windows 和 macOS 的
-> 单文件程序**没有构建**（也无法在此测试）。分发方式如上所述为源码分发。
-> 需要单文件程序时请参阅下面的“构建 Windows/macOS 可执行文件”。
+> **Windows / macOS 二进制文件**：预编译的 `.exe` / `.app` 由 CI 工作流生成并作为
+> 构建产物发布（见下文“Windows / macOS 二进制文件”）。本机只构建 Linux 安装包。
 
 ---
 
@@ -213,17 +213,48 @@ t1-keyboard-config --selftest --write
 
 ---
 
-## 构建 Windows/macOS 可执行文件
+## Windows / macOS 二进制文件
 
-本仓库以源码形式分发。需要单文件程序时：
+### 由 CI 构建（推荐）
+
+每次 push 都会运行 `build` 工作流（`.github/workflows/build.yml`），在 GitHub 托管
+运行器上构建并启动测试（**公开仓库免费**）：
+
+| 任务 | 产物 | CI 中的检查 |
+| --- | --- | --- |
+| `windows` | `t1-keyboard-config.exe`（控制台）+ `t1-keyboard-config-gui.exe`（无窗口） | 单元测试，两个 exe 均启动（`--version`、`--help`） |
+| `macos` | `T1 Keyboard Config.app`（arm64 + x86_64）+ `t1-keyboard-config-cli` | 单元测试，两个程序均启动 |
+| `linux` | `t1-keyboard-linux-<ver>.tar.gz` | lint + 全部测试 |
+
+下载：**Actions → `build` → 绿色运行 → Artifacts**（保留 90 天），或推送 `v*` 标签后
+的发行版附件。
+
+### 在目标系统上本地构建
+
+PyInstaller 不是交叉编译器：`.exe` 必须在 Windows 上构建，`.app` 必须在 macOS 上构建
+（在非 Apple 硬件上虚拟化 macOS 不被允许）。
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
-# 输出：dist/t1-keyboard-config(.exe)   ※必须在各自系统上构建
+# Windows
+pyinstaller --onefile            linux/t1-keyboard-config   # 控制台 exe
+pyinstaller --onefile --windowed linux/t1-keyboard-config   # GUI exe
+# macOS
+pyinstaller --onefile --windowed --name "T1 Keyboard Config" linux/t1-keyboard-config
 ```
 
-**本环境未构建**（需要真实的 Windows/macOS 机器或 CI）。
+### 各处验证的范围
+
+- Linux：实机验证（写入、监听、GUI 全部通过）
+- CI：冻结程序能在 Windows 11 / macOS 运行器上启动，测试通过
+- Windows/macOS 的设备 I/O：**CI 无法覆盖**（没有键盘）。请在实机上运行
+  `t1-keyboard-config --selftest`，或在 Windows 11 虚拟机
+  （Hyper-V / KVM + USB 直通）中验证
+
+### 签名
+
+二进制文件未签名：Windows 会显示 SmartScreen 警告（“更多信息 → 仍要运行”）；macOS 请
+右键 → 打开，或执行 `xattr -d com.apple.quarantine "<app>"`。
 
 ---
 
@@ -256,6 +287,7 @@ README.ja.md                日语版
 README.zh-CN.md             本文件（简体中文）
 README.ko.md                韩语版
 LICENSE                     MIT
+.github/workflows/build.yml CI 构建 Windows / macOS 二进制文件
 99-t1-keyboard.rules        udev 规则（独立副本，仅 Linux）
 linux/                      程序本体及构建所需的一切
   t1-keyboard-config        单文件程序（可执行 / 三系统通用）
@@ -269,7 +301,7 @@ dist/                       构建产物（.tar.gz / .deb / .pkg.tar.zst / SHA25
 decompiled/, Release/       厂商源码与程序，仅保留在本地，不入库
 ```
 
-测试与代码检查（在 `linux/` 内执行）：`python3 tests/test_protocol.py` 等（共 41 件）、
+测试与代码检查（在 `linux/` 内执行）：`python3 tests/test_protocol.py` 等（共 44 件）、
 `ruff check .`
 
 ---

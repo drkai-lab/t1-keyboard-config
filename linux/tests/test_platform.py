@@ -4,6 +4,8 @@
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -123,6 +125,77 @@ class InputSourceTest(unittest.TestCase):
         self.assertTrue(callable(t1.open_input_nodes))
         self.assertTrue(callable(t1.read_events))
         self.assertTrue(hasattr(t1, "select"))
+
+
+class WindowedBuildTest(unittest.TestCase):
+    def test_module_loads_when_stdout_is_none(self):
+        """PyInstaller --windowed starts with sys.stdout/sys.stderr = None."""
+        code = (
+            "import sys\n"
+            "sys.stdout = None\n"
+            "sys.stderr = None\n"
+            "import importlib.machinery, importlib.util\n"
+            f"loader = importlib.machinery.SourceFileLoader('t1k_ns', {SCRIPT!r})\n"
+            "spec = importlib.util.spec_from_loader('t1k_ns', loader)\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "loader.exec_module(mod)\n"
+            "mod.APP_NAME\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_frozen_monitor_spawn_skips_script_argument(self):
+        """A frozen app must spawn itself without a script path."""
+        real_popen = t1.subprocess.Popen
+        real_wpctl = t1.which_wpctl
+        real_frozen = getattr(sys, "frozen", False)
+        captured = {}
+
+        def fake_popen(command, **_kwargs):
+            captured["command"] = command
+
+            class Proc:
+                pid = 424242
+
+            return Proc()
+
+        try:
+            t1.subprocess.Popen = fake_popen
+            t1.which_wpctl = lambda: True
+            sys.frozen = True
+            ok, error = t1.start_monitor_process()
+        finally:
+            t1.subprocess.Popen = real_popen
+            t1.which_wpctl = real_wpctl
+            if not real_frozen:
+                delattr(sys, "frozen")
+        self.assertTrue(ok, error)
+        self.assertEqual(captured["command"][-2:], [sys.executable, "--monitor"])
+
+    def test_unfrozen_monitor_spawn_passes_script_path(self):
+        real_popen = t1.subprocess.Popen
+        real_wpctl = t1.which_wpctl
+        captured = {}
+
+        def fake_popen(command, **_kwargs):
+            captured["command"] = command
+
+            class Proc:
+                pid = 424243
+
+            return Proc()
+
+        try:
+            t1.subprocess.Popen = fake_popen
+            t1.which_wpctl = lambda: True
+            ok, error = t1.start_monitor_process()
+        finally:
+            t1.subprocess.Popen = real_popen
+            t1.which_wpctl = real_wpctl
+        self.assertTrue(ok, error)
+        self.assertEqual(captured["command"][-1], "--monitor")
+        self.assertNotEqual(captured["command"][-2], "--monitor")
 
 
 if __name__ == "__main__":

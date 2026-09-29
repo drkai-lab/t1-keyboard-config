@@ -1,6 +1,9 @@
 # T1 Keyboard Config
 
-T1 ミニキーボード(USB VID `1189` / PID `8890`)向けの **クロスプラットフォーム設定ツール**です。
+T1 ミニキーボード(USB VID `1189` / PID `8890`)、すなわち AliExpress の
+[「6 キー 1 ノブ RGB プログラミングマクロゲーミングノブキーパッド ミニカスタムプログラミングキーボード
+Photoshop 用 USB メカニカルキーボード」](https://ja.aliexpress.com/item/1005009812219099.html)
+向けの**クロスプラットフォーム設定ツール**です。
 ベンダー製 Windows 版 `MINI KeyBoard.exe` のプロトコルを解析し、**Tkinter(標準ライブラリ)** で
 書き直した単一ファイルの Python アプリです。追加のランタイム依存はありません。
 
@@ -94,10 +97,9 @@ python3 t1-keyboard-config
 ln -s "$(pwd)/t1-keyboard-config" /usr/local/bin/t1-keyboard-config
 ```
 
-> **スキップ理由**: この開発環境は Linux のみのため、Windows/macOS 向けの
-> 単体実行ファイル(`.exe` / `.app`)は**生成していません**(実行検証も不能)。
-> 上記はソース配布での利用手順です。単体 exe が要る場合のビルド手順は
-> 「Windows/macOS 向けの exe を作る場合」を参照してください。
+> **Windows/macOS バイナリ**: 事前ビルドの `.exe` / `.app` は CI ワークフローが生成し
+> アーティファクトとして公開します(「Windows/macOS バイナリ」節を参照)。
+> このマシンでビルドするのは Linux パッケージのみです。
 
 ---
 
@@ -214,17 +216,48 @@ t1-keyboard-config --selftest --write
 
 ---
 
-## Windows/macOS 向けの exe を作る場合
+## Windows/macOS バイナリ
 
-このリポジトリはソース配布です。単体実行ファイルが必要な場合:
+### CI がビルド(推奨)
+
+push のたびに `build` ワークフロー(`.github/workflows/build.yml`)が走り、GitHub の
+ランナー上でバイナリをビルドして起動テストします(**公開リポジトリなら無料**):
+
+| ジョブ | 生成物 | CI での検査 |
+| --- | --- | --- |
+| `windows` | `t1-keyboard-config.exe` (コンソール) + `t1-keyboard-config-gui.exe` (GUI) | ユニットテスト、両 exe の起動 (`--version` / `--help`) |
+| `macos` | `T1 Keyboard Config.app` (arm64 + x86_64) + `t1-keyboard-config-cli` | ユニットテスト、両バイナリの起動 |
+| `linux` | `t1-keyboard-linux-<ver>.tar.gz` | lint + 全テスト |
+
+入手: **Actions → `build` → 緑の実行 → Artifacts**(90日間保持)、`v*` タグ push 時は
+リリースのアセット。
+
+### 各 OS 上でのローカルビルド
+
+PyInstaller はクロスコンパイラではありません。`.exe` は Windows 上、`.app` は macOS 上で
+ビルドする必要があります(macOS の非 Apple ハードウェア仮想化は許可されていません)。
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
-# 生成物: dist/t1-keyboard-config(.exe)   ※各 OS 上でビルドする必要があります
+# Windows
+pyinstaller --onefile            linux/t1-keyboard-config   # コンソール exe
+pyinstaller --onefile --windowed linux/t1-keyboard-config   # GUI exe
+# macOS
+pyinstaller --onefile --windowed --name "T1 Keyboard Config" linux/t1-keyboard-config
 ```
 
-**この環境では実行できないため未生成**です(Windows/macOS の実機または CI が必要)。
+### 検証の範囲
+
+- Linux: 実機で検証済み(書き込み・モニタ・GUI)
+- CI: 凍結バイナリが Windows 11 / macOS のランナー上で起動し、テストが通ること
+- Windows/macOS のデバイス I/O: CI では検証できません(キーボードが接続されていない)。
+  実機で `t1-keyboard-config --selftest`、または Windows 11 VM
+  (Hyper-V / KVM + USB パススルー)で確認してください
+
+### 署名
+
+バイナリは未署名です。Windows は SmartScreen 警告(「詳細情報 → 実行」)、macOS は
+右クリック → 開く、または `xattr -d com.apple.quarantine "<app>"` で無効化できます。
 
 ---
 
@@ -260,6 +293,7 @@ README.ja.md                このファイル (日本語)
 README.zh-CN.md             簡体字中国語版
 README.ko.md                韓国語版
 LICENSE                     MIT
+.github/workflows/build.yml CI での Windows/macOS バイナリ生成
 99-t1-keyboard.rules        udev ルール (単体コピー / Linux のみ)
 linux/                      本体とビルドに使うものすべて
   t1-keyboard-config        単一ファイルの本体 (実行可能 / 3 OS 共通)
@@ -273,7 +307,7 @@ dist/                       生成物 (.tar.gz / .deb / .pkg.tar.zst / SHA256SUM
 decompiled/, Release/       ベンダー資産 (ローカルのみ、リポジトリには含めない)
 ```
 
-テストと lint (`linux/` 内で実行): `python3 tests/test_protocol.py` ほか(計41件)、
+テストと lint (`linux/` 内で実行): `python3 tests/test_protocol.py` ほか(計44件)、
 `ruff check .`
 
 ---

@@ -1,7 +1,8 @@
 # T1 Keyboard Config
 
-Cross-platform configuration tool for the T1 mini keyboard (USB VID `1189` / PID `8890`).
-We reverse-engineered the vendor's Windows `MINI KeyBoard.exe` and rewrote it as a
+Cross-platform configuration tool for the **T1 mini keyboard** — the
+[6 Keys 1 Knob RGB Programming Macro Gaming Keypad](https://ja.aliexpress.com/item/1005009812219099.html) (AliExpress,
+USB VID `1189` / PID `8890`). We reverse-engineered the vendor's Windows `MINI KeyBoard.exe` and rewrote it as a
 single-file Python application using **Tkinter (standard library only)** — no runtime
 dependencies.
 
@@ -96,10 +97,9 @@ python3 t1-keyboard-config
 ln -s "$(pwd)/t1-keyboard-config" /usr/local/bin/t1-keyboard-config
 ```
 
-> **Why no `.exe` / `.app`**: this development environment is Linux-only, so Windows and
-> macOS binaries were **not built** (and cannot be tested here). The distribution is
-> source-based as shown above. For build instructions see
-> "Building a Windows/macOS executable" below.
+> **Windows / macOS binaries**: prebuilt `.exe` / `.app` files are produced by the CI
+> workflow and published as artifacts - see "Windows / macOS binaries" below. This
+> machine only builds the Linux packages.
 
 ---
 
@@ -216,17 +216,49 @@ Codes used by the monitor and the learners are normalized to **Linux evdev codes
 
 ---
 
-## Building a Windows/macOS executable
+## Windows / macOS binaries
 
-This repository ships as source. If you need a standalone binary:
+### Built by CI (recommended)
+
+Every push runs the `build` workflow (`.github/workflows/build.yml`), which builds and
+launch-tests the binaries on GitHub's runners - **free for public repositories**:
+
+| Job | Output | Checked in CI |
+| --- | --- | --- |
+| `windows` | `t1-keyboard-config.exe` (console) + `t1-keyboard-config-gui.exe` (windowed) | unit tests, both exes launched (`--version`, `--help`) |
+| `macos` | `T1 Keyboard Config.app` (arm64 + x86_64) + `t1-keyboard-config-cli` | unit tests, both binaries launched |
+| `linux` | `t1-keyboard-linux-<ver>.tar.gz` | lint + all tests |
+
+Download: **Actions -> `build` -> a green run -> Artifacts** (kept 90 days), or the
+release assets when a `v*` tag is pushed.
+
+### Build locally on the target OS
+
+PyInstaller is not a cross-compiler: `.exe` must be built on Windows and `.app` on
+macOS (virtualising macOS on non-Apple hardware is not permitted).
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
-# output: dist/t1-keyboard-config(.exe)  - must be built on each target OS
+# Windows
+pyinstaller --onefile            linux/t1-keyboard-config   # console exe
+pyinstaller --onefile --windowed linux/t1-keyboard-config   # GUI exe
+# macOS
+pyinstaller --onefile --windowed --name "T1 Keyboard Config" linux/t1-keyboard-config
 ```
 
-**Not built here** — a real Windows/macOS machine or CI is required to build and test it.
+### What is verified where
+
+- Linux: real hardware - writes, monitor and GUI all verified
+- CI: the frozen binaries start on the Windows 11 / macOS runners and the test suite passes
+- Device I/O on Windows/macOS: **not** covered by CI (no keyboard attached). Run
+  `t1-keyboard-config --selftest` on the machine, or inside a Windows 11 VM
+  (Hyper-V / KVM with USB passthrough of the keypad)
+
+### Signing
+
+The binaries are unsigned: Windows shows a SmartScreen warning ("More info -> Run
+anyway"); on macOS use right-click -> Open, or
+`xattr -d com.apple.quarantine "<app>"`.
 
 ---
 
@@ -264,6 +296,7 @@ README.ja.md                Japanese
 README.zh-CN.md             Simplified Chinese
 README.ko.md                Korean
 LICENSE                     MIT
+.github/workflows/build.yml CI build of the Windows / macOS binaries
 99-t1-keyboard.rules        udev rule (standalone copy, Linux only)
 linux/                      the program and everything used to build it
   t1-keyboard-config        single-file program (executable, all 3 OSes)
@@ -278,7 +311,7 @@ decompiled/, Release/       vendor sources and binaries, local only, not in the 
 ```
 
 Tests and lint (run inside `linux/`): `python3 tests/test_protocol.py` and friends
-(41 total), `ruff check .`
+(44 total), `ruff check .`
 
 ---
 

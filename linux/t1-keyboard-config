@@ -23,6 +23,7 @@ import argparse
 import ctypes
 import errno
 import glob
+import io
 import json
 import os
 import platform
@@ -45,6 +46,13 @@ except ImportError:  # Windows
 IS_LINUX = sys.platform.startswith("linux")
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
+
+# Frozen windowed builds (--windowed / --noconsole) start with stdout/stderr
+# as None; every print() would then raise AttributeError.
+for _stream in ("stdout", "stderr"):
+    if getattr(sys, _stream, None) is None:
+        setattr(sys, _stream, io.StringIO())
+del _stream
 
 VERSION = "1.1.0"
 APP_NAME = "t1-keyboard-config"
@@ -2130,8 +2138,13 @@ def start_monitor_process():
     if IS_LINUX and not which_wpctl():
         return False, "wpctl not found (install pipewire-utils)"
     try:
-        script = os.path.abspath(globals().get("__file__", sys.argv[0]))
-        command = [sys.executable, script, "--monitor"]
+        if getattr(sys, "frozen", False):
+            # PyInstaller: sys.executable is the app itself, __file__ points
+            # into the temporary extraction dir and must not be passed back.
+            command = [sys.executable, "--monitor"]
+        else:
+            script = os.path.abspath(globals().get("__file__", sys.argv[0]))
+            command = [sys.executable, script, "--monitor"]
         if IS_WIN:
             subprocess.Popen(
                 command,
