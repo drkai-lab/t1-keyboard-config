@@ -728,7 +728,7 @@ def _mac():
     iohid = ctypes.CDLL(
         "/System/Library/Frameworks/IOKit.framework/IOKit")
 
-    cfp, cfl, cfbl = ctypes.c_void_p, ctypes.c_long, ctypes.c_long
+    cfp, cfl = ctypes.c_void_p, ctypes.c_long
     cf.CFRelease.argtypes = [cfp]
     cf.CFStringCreateWithCString.restype = cfp
     cf.CFStringCreateWithCString.argtypes = [cfp, ctypes.c_char_p, cfl]
@@ -760,9 +760,13 @@ def _mac():
     cf.CFRunLoopGetCurrent.restype = cfp
     cf.CFRunLoopRunInMode.argtypes = [cfp, ctypes.c_double, ctypes.c_int]
     cf.CFRunLoopRunInMode.restype = cfl
+    cf.CFNumberGetValue.argtypes = [cfp, cfl, ctypes.c_void_p]
+    cf.CFNumberGetValue.restype = ctypes.c_int
     iohid.IOHIDManagerScheduleWithRunLoop.argtypes = [cfp, cfp, cfp]
     iohid.IOHIDManagerRegisterInputValueCallback.argtypes = [cfp, cfp, cfp]
     iohid.IOHIDManagerOpen.restype = cfl
+    iohid.IOHIDDeviceGetProperty.argtypes = [cfp, cfp]
+    iohid.IOHIDDeviceGetProperty.restype = cfp
 
     _MAC_LIBS.update({"cf": cf, "iohid": iohid})
     return _MAC_LIBS
