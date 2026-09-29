@@ -16,6 +16,9 @@ cp -a "${SRC_DIR}/t1-keyboard-config" \
       "${SRC_DIR}/install.sh" \
       "${SRC_DIR}/uninstall.sh" \
       "${SRC_DIR}/README.md" \
+      "${SRC_DIR}/README.ja.md" \
+      "${SRC_DIR}/README.zh-CN.md" \
+      "${SRC_DIR}/README.ko.md" \
       "${SRC_DIR}/LICENSE" \
       "${SRC_DIR}/ruff.toml" "${STAGE}/"
 cp -a "${SRC_DIR}/tests/." "${STAGE}/tests/"

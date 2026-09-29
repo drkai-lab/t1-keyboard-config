@@ -1,171 +1,175 @@
 # T1 Keyboard Config
 
-T1 ミニキーボード(USB VID `1189` / PID `8890`)向けの **クロスプラットフォーム設定ツール**です。
-ベンダー製 Windows 版 `MINI KeyBoard.exe` のプロトコルを解析し、**Tkinter(標準ライブラリ)** で
-書き直した単一ファイルの Python アプリです。追加のランタイム依存はありません。
+Cross-platform configuration tool for the T1 mini keyboard (USB VID `1189` / PID `8890`).
+We reverse-engineered the vendor's Windows `MINI KeyBoard.exe` and rewrote it as a
+single-file Python application using **Tkinter (standard library only)** — no runtime
+dependencies.
 
-| 対応 OS | 状態 |
+English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md)
+
+| Target OS | Status |
 | --- | --- |
-| Linux (Arch / Omarchy 推奨) | 実機検証済み(書き込み・モニタ・GUI) |
-| Windows 11 | 実装済み **未検証**(この環境に Windows が無いため) |
-| macOS | 実装済み **未検証**(この環境に macOS が無いため) |
+| Linux (Arch / Omarchy recommended) | Verified on hardware (writes, monitor, GUI) |
+| Windows 11 | Implemented, **not verified** (no Windows machine in this environment) |
+| macOS | Implemented, **not verified** (no macOS machine in this environment) |
 
-- キー割り当て(最大5グループのコンボ)、修飾キー、マルチメディア、マウス、LED
-- レイヤー 1/2/3 の切替と書き込み
-- ダイヤル操作 → 音量 / VRChat OSC
-- キー → VRChat OSC マッピング
-- 設定ファイルは 3 OS 間で互換(evdev コードに正規化して保存)
+- Key assignments (up to 5 combos per key), modifier keys, multimedia, mouse, LEDs
+- Layer 1/2/3 switching and flashing
+- Dial rotation → volume / VRChat OSC
+- Key → VRChat OSC mappings
+- `settings.json` is portable across the 3 OSes (all codes stored as Linux evdev codes)
 
 ---
 
-## 動作要件
+## Requirements
 
-| 項目 | Linux | Windows 11 | macOS |
+| Item | Linux | Windows 11 | macOS |
 | --- | --- | --- | --- |
-| Python | 3.9 以上 | 3.9 以上 (python.org / winget) | 3.9 以上 (python.org / brew) |
-| GUI | Tkinter (`tk`) | Tkinter (同梱) | Tkinter (`python-tk`) |
-| 書き込み経路 | usbfs (`/dev/bus/usb`) | HID (`WriteFile`) | IOHID (`SetReport`) |
-| 音量操作 | `wpctl` (任意) | Core Audio (内蔵) | `osascript` (内蔵) |
-| 追加パッケージ | なし | なし | なし |
+| Python | 3.9+ | 3.9+ (python.org / winget) | 3.9+ (python.org / brew) |
+| GUI | Tkinter (`tk`) | Tkinter (bundled) | Tkinter (`python-tk`) |
+| Write path | usbfs (`/dev/bus/usb`) | HID (`WriteFile`) | IOHID (`SetReport`) |
+| Volume control | `wpctl` (optional) | Core Audio (built in) | `osascript` (built in) |
+| Extra packages | none | none | none |
 
 ```bash
 # Arch
 sudo pacman -S tk pipewire-utils
 # Debian / Ubuntu
 sudo apt install python3-tk
-# Windows / macOS は Tkinter が既定で入っていることが多い
+# Windows / macOS usually ship Tkinter already
 python3 -c "import tkinter; print('ok')"
 ```
 
 ---
 
-## インストール
+## Installation
 
-### Linux: 配布パッケージ 3 種類
+### Linux: three prebuilt packages
 
-`./build-packages.sh` が `../dist/` に生成します。
+`./build-packages.sh` produces them in `../dist/`.
 
 ```bash
 # Arch Linux (pacman)
 sudo pacman -U dist/t1-keyboard-config-<ver>-1-x86_64.pkg.tar.zst
 
 # Debian / Ubuntu (dpkg)
-sudo dpkg -i dist/t1-keyboard-config_<ver>_amd64.deb   # 依存不足なら sudo apt install -f
+sudo dpkg -i dist/t1-keyboard-config_<ver>_amd64.deb   # then: sudo apt install -f if needed
 
-# どのディストリでも (tarball)
+# Any distro (tarball)
 tar xzf dist/t1-keyboard-linux-<ver>.tar.gz && cd t1-keyboard-linux-<ver> && ./install.sh
 ```
 
-パッケージ版は udev ルールを自動で再読込します(セッションに影響されず即時有効)。
+Packaged installs reload the udev rule immediately (no session-dependent reload).
 
-### ソースから(全 OS 共通)
+### From source (all OSes)
 
 ```bash
-./install.sh              # GUI + (Linux なら) udev ルール
-./install.sh --autostart  # ダイヤル/OSC 監視をログイン時にも自動起動
+./install.sh              # GUI + (on Linux) the udev rule
+./install.sh --autostart  # also start the dial/OSC monitor at login
 ```
 
-`install.sh` は次を行います。
+`install.sh` does the following:
 
-1. `~/.local/bin/t1-keyboard-config` に本体を配置
-2. `~/.local/share/applications/` にメニュー項目(「T1 キーボード設定」)を配置(Linux)
-3. Linux では `/etc/udev/rules.d/99-t1-keyboard.rules` を入れて udev を再読込
-   (このデバイス専用の usb / hidraw / input ノードを開放。macOS/Windows は不要)
-4. 最後に `--selftest` を自動実行して接続可否を表示
+1. Installs the program to `~/.local/bin/t1-keyboard-config`
+2. Installs a menu entry ("T1 キーボード設定" / "T1 Keyboard Config") to
+   `~/.local/share/applications/` (Linux)
+3. On Linux, installs `/etc/udev/rules.d/99-t1-keyboard.rules` and reloads udev
+   (opens only this device's usb / hidraw / input nodes; not needed on macOS/Windows)
+4. Runs `--selftest` at the end to report whether the device is usable
 
-アンインストール: `./uninstall.sh`
+Uninstall: `./uninstall.sh`
 
-### Windows 11 / macOS (ソース実行)
+### Windows 11 / macOS (run from source)
 
 ```powershell
-# Windows (PowerShell) - 追加インストール不要、そのまま実行
+# Windows (PowerShell) - nothing else to install
 python t1-keyboard-config            # GUI
-python t1-keyboard-config --selftest # 接続診断
+python t1-keyboard-config --selftest # connectivity check
 ```
 
 ```bash
 # macOS
 python3 t1-keyboard-config
-# メニューに置く場合
+# optional: put it on PATH
 ln -s "$(pwd)/t1-keyboard-config" /usr/local/bin/t1-keyboard-config
 ```
 
-> **スキップ理由**: この開発環境は Linux のみのため、Windows/macOS 向けの
-> 単体実行ファイル(`.exe` / `.app`)は**生成していません**(実行検証も不能)。
-> 上記はソース配布での利用手順です。単体 exe が要る場合のビルド手順は
-> 「Windows/macOS 向けの exe を作る場合」を参照してください。
+> **Why no `.exe` / `.app`**: this development environment is Linux-only, so Windows and
+> macOS binaries were **not built** (and cannot be tested here). The distribution is
+> source-based as shown above. For build instructions see
+> "Building a Windows/macOS executable" below.
 
 ---
 
-## 起動方法
+## Usage
 
 ```bash
-t1-keyboard-config            # 設定 GUI (PATH に ~/.local/bin が必要)
-t1-keyboard-config --selftest # 接続・権限・書き込み経路の自己診断
-t1-keyboard-config --watch    # T1 の入力イベントをライブ表示 (動作確認)
-t1-keyboard-config --monitor  # ダイヤル/OSC 監視デーモン (フォアグラウンド)
+t1-keyboard-config            # configuration GUI (needs ~/.local/bin on PATH)
+t1-keyboard-config --selftest # device, permission and write-path diagnostics
+t1-keyboard-config --watch    # live stream of T1 input events
+t1-keyboard-config --monitor  # dial/OSC monitor daemon (foreground)
 t1-keyboard-config --version
 ```
 
-### 動作確認(書き込みが効いているか)
+### Verify that writes take effect
 
 ```bash
-t1-keyboard-config --watch      # 1) KEY1 を押して現在のコードを確認
+t1-keyboard-config --watch      # 1) press KEY1 to see its current code
 ```
 
-GUI で `KEY1` を選び、`マルチメディア` タブの「再生/一時停止」を**書き込み**。
-続けて
+In the GUI select `KEY1`, open the `Multimedia` tab, pick "Play/Pause" and press
+**Write**. Then run
 
 ```bash
-t1-keyboard-config --watch      # 2) もう一度 KEY1 を押す
+t1-keyboard-config --watch      # 2) press KEY1 again
 ```
 
-で `KEY_PLAYPAUSE` が出ていれば正常です(元のコードに戻すには「無効」を書き込み)。
+It should now report `KEY_PLAYPAUSE` (write "None" to restore the original).
 
-### GUI の使い方
+### GUI walkthrough
 
-1. 上部の**レイヤー** (1/2/3) を選ぶ
-2. 左の**物理キー** (KEY1〜KEY12 / K1-L〜K2-R) を選ぶ
-3. 右のタブで割り当てを選ぶ
-   - `キー` … 単打キー(行をダブルクリックですぐ書き込み)
-   - `修飾キー` … 修飾キー + ベースキー、複数グループ追加可(最大5)
-   - `マルチメディア` / `マウス` / `LED`
-4. 「**書き込み**」を押す
+1. Pick a **layer** (1/2/3) at the top
+2. Pick a **physical key** on the left (KEY1–KEY12 / K1-L…K2-R)
+3. Choose the assignment on the right-hand tabs
+   - `Keys` … a single key (double-click a row to write immediately)
+   - `Modifiers` … modifier + base key, up to 5 groups
+   - `Multimedia` / `Mouse` / `LED`
+4. Press **Write**
 
-> マッピングはキーボード本体のフラッシュに保存されるため、**このツールでは読み戻せません**。
-> 「現在の設定内容」は本ツールが書き込んだ記録のみを表示します。
+> Mappings are stored in the keyboard's flash, so **they cannot be read back**.
+> "Current settings" only shows what this tool has written.
 
-### ダイヤル / VRChat OSC
+### Dial / VRChat OSC
 
-1. `ダイヤル` タブで使うモードを選ぶ(マイク / イヤーマフ / ユーザー音量)
-2. 「**回転を学習**」→ ダイヤルを回す(既定は REL_HWHEEL / REL_WHEEL)
-3. 「**押し込みを学習**」→ ダイヤルを1回押す
-4. 「**監視開始**」(または `t1-keyboard-config --monitor` / `--autostart`)
-5. `VRChat OSC` タブでキーごとに OSC アドレスを設定し、必要な行を「...」で**学習**
-   (T1 のそのキーを押すとコードが記録されます)
+1. In the `Dial` tab pick the mode you want to control (mic / headphone / user volume)
+2. Press "Learn rotation" and turn the dial (defaults: REL_HWHEEL / REL_WHEEL)
+3. Press "Learn press" and press the dial once
+4. Press "Start monitor" (or run `t1-keyboard-config --monitor` / `--autostart`)
+5. In the `VRChat OSC` tab set an OSC address per key and click "…" to **learn** the
+   key code (press that T1 key while it listens)
 
-音量は Linux=`wpctl`、Windows=Core Audio、macOS=`osascript`、OSC は UDP 送信です。
-ログ: Linux `~/.local/state/t1-keyboard/monitor.log` /
+Volume backends: Linux=`wpctl`, Windows=Core Audio, macOS=`osascript`; OSC is sent over UDP.
+Log: Linux `~/.local/state/t1-keyboard/monitor.log` /
 Windows/macOS `%APPDATA%\t1-keyboard\state\monitor.log`
 
 ---
 
-## 自己診断
+## Self test
 
 ```bash
 t1-keyboard-config --selftest
 ```
 
-| 検査項目 | 失敗時の対処 |
+| Check | If it fails |
 | --- | --- |
-| platform | 実行中の OS / Python バージョン |
-| udev rule installed (Linux) | `sudo ./install.sh` を再実行 |
-| usb device present (Linux) | ケーブル / ハブを確認 |
-| usb node permission (Linux) | udev ルール再読込後、抜け挿し(`--selftest` 再実行) |
-| config interface | 別プロセスが掴んでいないか確認 |
-| hidraw / input events | 同上。`sudo udevadm trigger` |
+| platform | reported OS / Python version |
+| udev rule installed (Linux) | re-run `sudo ./install.sh` |
+| usb device present (Linux) | check cable / hub |
+| usb node permission (Linux) | reload the udev rule, replug the device, re-run `--selftest` |
+| config interface | check that no other process holds the device |
+| hidraw / input events | same as above; `sudo udevadm trigger` |
 
-書き込み経路まで実際に試す場合:
+To also attempt a harmless write:
 
 ```bash
 t1-keyboard-config --selftest --write
@@ -173,101 +177,106 @@ t1-keyboard-config --selftest --write
 
 ---
 
-## 実装メモ(プロトコル)
+## Implementation notes (protocol)
 
-元の Windows 版は USB **インターフェース 1 (mi_01)** に対して出力レポートを送ります。
-このインターフェースは interrupt-OUT (EP 0x02) のみで、OS ごとに次の経路を使います。
+The original Windows tool sends output reports to **USB interface 1 (`mi_01`)**.
+That interface exposes interrupt-OUT (EP 0x02) only, so each OS takes a different path:
 
-| OS | 経路 |
+| OS | Path |
 | --- | --- |
-| Linux | usbfs (`USBDEVFS_SUBMITURB` → 失敗時 SET_REPORT)。`usbhid` は IF1 にバインドしません |
-| Windows | `mi_01` の HID デバイスを開き `WriteFile`(= ベンダー版の `WriteReport` と同じ) |
+| Linux | usbfs (`USBDEVFS_SUBMITURB`, falling back to SET_REPORT). `usbhid` never binds IF1 |
+| Windows | open the HID device on `mi_01` and `WriteFile` (same as the vendor's `WriteReport`) |
 | macOS | `IOHIDDeviceSetReport(kIOHIDReportTypeOutput)` |
 
-フレームは `[ReportID][payload...]`。元版 `Download_Click` と同じ並びです。
+Frames are `[ReportID][payload...]`, in the same order as the original `Download_Click`.
 
-| 種別 | ペイロード |
+| Kind | Payload |
 | --- | --- |
-| キー | `[keynum][layer<<4\|1][groupCount][groupIndex][mod][usage]` (groupCount+1 本) |
-| マルチメディア | `[keynum][layer<<4\|2][b5][b6]` |
-| マウス | `[keynum][layer<<4\|3][buttons][x][y][wheel][pan]` |
+| Key | `[keynum][layer<<4\|1][groupCount][groupIndex][mod][usage]` (groupCount+1 entries) |
+| Multimedia | `[keynum][layer<<4\|2][b5][b6]` |
+| Mouse | `[keynum][layer<<4\|3][buttons][x][y][wheel][pan]` |
 | LED | `[0xB0][layer<<4\|8][mode]` |
-| レイヤー切替 | `[0xA1][layer]` |
-| フラッシュ確定 | `[0xAA][0xAA]` / LED は `[0xAA,0xA1]` |
+| Layer switch | `[0xA1][layer]` |
+| Flash commit | `[0xAA][0xAA]` / LEDs: `[0xAA,0xA1]` |
 
-レポートIDは HID レポートディスクリプタから自動判定し、取れなければ
-元版と同じ `3 → 0 → 2` の順でプローブします(`ReportID==0` の場合のみレイヤー nibble なし)。
+The report ID is auto-detected from the HID report descriptor, otherwise probed in the
+vendor's order `3 → 0 → 2` (`ReportID==0` disables the layer nibble).
 
-### 入力イベントの正規化
+### Input event normalization
 
-モニタ/学習で使うコードは **Linux evdev コードに正規化**して保存します。
+Codes used by the monitor and the learners are normalized to **Linux evdev codes**.
 
-- Linux: evdev をそのまま読む
-- Windows: Raw Input (`WM_INPUT`) → `VK_TO_EVDEV` で変換(T1 のみにフィルタ)
-- macOS: IOHID コールバック → `HID_USAGE_TO_EVDEV` / `CONSUMER_TO_EVDEV` で変換
+- Linux: read evdev directly
+- Windows: Raw Input (`WM_INPUT`) → `VK_TO_EVDEV` (filtered to the T1 only)
+- macOS: IOHID callbacks → `HID_USAGE_TO_EVDEV` / `CONSUMER_TO_EVDEV`
 
-これにより `settings.json` は OS をまたいでそのまま使えます。
+`settings.json` therefore transfers between OSes unchanged.
 
 ---
 
-## Windows/macOS 向けの exe を作る場合
+## Building a Windows/macOS executable
 
-このリポジトリはソース配布です。単体実行ファイルが必要な場合:
+This repository ships as source. If you need a standalone binary:
 
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name t1-keyboard-config t1-keyboard-config
-# 生成物: dist/t1-keyboard-config(.exe)   ※各 OS 上でビルドする必要があります
+# output: dist/t1-keyboard-config(.exe)  - must be built on each target OS
 ```
 
-**この環境では実行できないため未生成**です(Windows/macOS の実機または CI が必要)。
+**Not built here** — a real Windows/macOS machine or CI is required to build and test it.
 
 ---
 
-## セキュリティ上の注意
+## Security notes
 
-`99-t1-keyboard.rules` は **VID/PID が一致するノードのみ** を `MODE="0666"` にします(Linux のみ)。
-これにより再ログインや `input` グループ追加なしで動きますが、そのマシンにログインできる
-他のユーザーも同デバイスへアクセスできます。複数ユーザー環境では `MODE="0660"` +
-`GROUP="input"` に変更し、利用者を `input` グループに入れてください。
+`99-t1-keyboard.rules` sets `MODE="0666"` **only on nodes whose VID/PID match**
+(Linux only). That avoids re-login and `input` group changes, but any user logged into
+that machine can then access the device. On shared machines use `MODE="0660"` +
+`GROUP="input"` and add the users to the `input` group.
 
-macOS でキー学習が動かない場合は「システム設定 → プライバシーとセキュリティ →
-**入力モニタリング**」で本ツールを許可してください。
-
----
-
-## 既知の制限
-
-- ファームウェアからの設定読み出しは存在しないため、書き込み結果は本体側で確認する必要があります
-- 学習(ダイヤル押し込み / キーコード)は本体の実装に依存するため、初回に1回ずつ実施してください
-- Windows 版の「K3」「KEY13〜16」ボタンは元バイナリでも未実装のため本ツールにもありません
-- **Windows/macOS の書き込み・入力バックエンドは未検証**です(開発環境に該当 OS が無いため)。
-  実機で `--selftest` を必ず実行してください。失敗時はエラー内容がトースト/標準出力に出ます
-- Windows のキーコードはキーボードレイアウト依存の VK を evdev に変換しています
-  (日本語配列の特殊キーなど一部は学習対象外)
+If key learning does not work on macOS, allow this tool under
+"System Settings → Privacy & Security → **Input Monitoring**".
 
 ---
 
-## ファイル構成
+## Known limitations
+
+- The firmware offers no readback, so the effect of a write must be confirmed on the device
+- Learning (dial press / key codes) depends on the hardware; do it once on first use
+- The Windows app's "K3" and "KEY13–16" buttons are unimplemented in the original binary,
+  so they are absent here as well
+- **The Windows/macOS write and input backends are unverified** (no such OS in this
+  development environment). Always run `--selftest` on the real machine; failures are
+  reported in the toast / stdout
+- Windows key codes convert layout-dependent VK values to evdev codes (some Japanese-layout
+  special keys are not learnable)
+
+---
+
+## Repository layout
 
 ```
-t1-keyboard-config          本体 (単一ファイル / 実行可能 / 3 OS 共通)
-99-t1-keyboard.rules        udev ルール (Linux のみ)
-install.sh / uninstall.sh   インストーラ / アンインストーラ
-tests/test_protocol.py      プロトコルエンコーダのゴールデンテスト
-tests/test_monitor.py       モニタ → OSC の結合テスト
-tests/test_platform.py      キーテーブル / パス / 入力バックエンドのテスト
-packaging/                  .deb / pacman 用のパッケージ定義
-build-release.sh            tarball 生成
-build-packages.sh           tarball + .deb + .pkg.tar.zst 一括生成
+t1-keyboard-config          the program (single file / executable / all 3 OSes)
+99-t1-keyboard.rules        udev rule (Linux only)
+install.sh / uninstall.sh   installer / uninstaller
+tests/test_protocol.py      protocol encoder golden tests
+tests/test_monitor.py       monitor -> OSC integration test
+tests/test_platform.py      key tables / paths / input backends
+packaging/                  .deb and pacman package definitions
+build-release.sh            tarball build
+build-packages.sh           tarball + .deb + .pkg.tar.zst in one step
 LICENSE                     MIT
-README.md                   このファイル
+README.md                   this file (English)
+README.ja.md                Japanese
+README.zh-CN.md             Simplified Chinese
+README.ko.md                Korean
 ```
 
-テスト: `python3 tests/test_protocol.py` ほか(計41件)。lint: `ruff check .`
+Tests: `python3 tests/test_protocol.py` and friends (41 total). Lint: `ruff check .`
 
 ---
 
-## ライセンス
+## License
 
-MIT(参照: `LICENSE`)。非公式ツールです。ベンダーおよび T1 とは関係ありません。
+MIT (see `LICENSE`). Unofficial tool, not affiliated with the vendor or T1.
