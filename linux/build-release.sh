@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SRC_DIR}/.." && pwd)"
 VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "${SRC_DIR}/t1-keyboard-config")"
 NAME="t1-keyboard-linux-${VERSION}"
 DIST="$(cd "${SRC_DIR}/.." && pwd)/dist"
@@ -15,11 +16,11 @@ cp -a "${SRC_DIR}/t1-keyboard-config" \
       "${SRC_DIR}/99-t1-keyboard.rules" \
       "${SRC_DIR}/install.sh" \
       "${SRC_DIR}/uninstall.sh" \
-      "${SRC_DIR}/README.md" \
-      "${SRC_DIR}/README.ja.md" \
-      "${SRC_DIR}/README.zh-CN.md" \
-      "${SRC_DIR}/README.ko.md" \
-      "${SRC_DIR}/LICENSE" \
+      "${ROOT}/README.md" \
+      "${ROOT}/README.ja.md" \
+      "${ROOT}/README.zh-CN.md" \
+      "${ROOT}/README.ko.md" \
+      "${ROOT}/LICENSE" \
       "${SRC_DIR}/ruff.toml" "${STAGE}/"
 cp -a "${SRC_DIR}/tests/." "${STAGE}/tests/"
 

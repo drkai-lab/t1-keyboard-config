@@ -62,6 +62,8 @@ tar xzf dist/t1-keyboard-linux-<ver>.tar.gz && cd t1-keyboard-linux-<ver> && ./i
 
 ### 从源码安装（所有系统）
 
+以下命令在克隆仓库的 `linux/` 目录中执行（`cd linux`）。
+
 ```bash
 ./install.sh              # 图形界面 +（Linux 上的）udev 规则
 ./install.sh --autostart  # 登录时自动启动旋钮/OSC 监听
@@ -217,7 +219,7 @@ t1-keyboard-config --selftest --write
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config t1-keyboard-config
+pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
 # 输出：dist/t1-keyboard-config(.exe)   ※必须在各自系统上构建
 ```
 
@@ -249,23 +251,26 @@ macOS 上按键学习无效时，请在“系统设置 → 隐私与安全性 �
 ## 仓库结构
 
 ```
-t1-keyboard-config          程序本体（单文件 / 可执行 / 三系统通用）
-99-t1-keyboard.rules        udev 规则（仅 Linux）
-install.sh / uninstall.sh   安装 / 卸载脚本
-tests/test_protocol.py      协议编码器黄金测试
-tests/test_monitor.py       监听 → OSC 集成测试
-tests/test_platform.py      键值表 / 路径 / 输入后端测试
-packaging/                  .deb 与 pacman 打包定义
-build-release.sh            生成 tarball
-build-packages.sh           一键生成 tarball + .deb + .pkg.tar.zst
-LICENSE                     MIT
 README.md                   英语版
 README.ja.md                日语版
 README.zh-CN.md             本文件（简体中文）
 README.ko.md                韩语版
+LICENSE                     MIT
+99-t1-keyboard.rules        udev 规则（独立副本，仅 Linux）
+linux/                      程序本体及构建所需的一切
+  t1-keyboard-config        单文件程序（可执行 / 三系统通用）
+  99-t1-keyboard.rules      install.sh 安装的 udev 规则
+  install.sh / uninstall.sh 安装 / 卸载脚本
+  tests/                    协议 / 监听 / 平台测试
+  packaging/                .deb 与 pacman 打包定义
+  build-release.sh          生成 tarball
+  build-packages.sh         一键生成 tarball + .deb + .pkg.tar.zst
+dist/                       构建产物（.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS）
+decompiled/, Release/       厂商源码与程序，仅保留在本地，不入库
 ```
 
-测试：`python3 tests/test_protocol.py` 等（共 41 件）。代码检查：`ruff check .`
+测试与代码检查（在 `linux/` 内执行）：`python3 tests/test_protocol.py` 等（共 41 件）、
+`ruff check .`
 
 ---
 

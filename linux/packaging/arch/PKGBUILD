@@ -5,9 +5,9 @@ pkgver="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$startdir/../../t1-keyboard-confi
 pkgrel=1
 pkgdesc="T1 mini keyboard configurator (USB VID 1189 / PID 8890)"
 arch=('x86_64')
-url=""  # repository URL, if you publish one
+url="https://github.com/drkai-lab/t1-keyboard-config"
 license=('MIT')
-depends=('python' 'python-gobject' 'libadwaita')
+depends=('python' 'tk')
 optdepends=('pipewire-utils: wpctl volume control for the dial')
 source=()
 sha256sums=()
@@ -22,8 +22,9 @@ check() {
   install -Dm755 "$startdir/payload/usr/bin/t1-keyboard-config" \
     "$tmp/t1-keyboard-config"
   cp -a "$startdir/tests" "$tmp/tests"
-  python3 "$tmp/tests/test_protocol.py"
-  python3 "$tmp/tests/test_monitor.py"
+  for t in "$tmp"/tests/test_*.py; do
+    python3 "$t" >/dev/null
+  done
   rm -rf "$tmp"
 }
 

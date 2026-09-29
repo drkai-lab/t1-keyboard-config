@@ -4,7 +4,7 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: T1 Keyboard Config contributors <t1kb@example.com>
-Depends: python3 (>= 3.9), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1
+Depends: python3 (>= 3.9), python3-tk
 Recommends: pipewire-utils
 Installed-Size: @SIZE@
 Description: T1 mini keyboard configurator for Linux

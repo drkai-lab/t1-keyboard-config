@@ -63,6 +63,8 @@ Packaged installs reload the udev rule immediately (no session-dependent reload)
 
 ### From source (all OSes)
 
+The commands below run from the `linux/` directory of a clone (`cd linux`).
+
 ```bash
 ./install.sh              # GUI + (on Linux) the udev rule
 ./install.sh --autostart  # also start the dial/OSC monitor at login
@@ -220,7 +222,7 @@ This repository ships as source. If you need a standalone binary:
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config t1-keyboard-config
+pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
 # output: dist/t1-keyboard-config(.exe)  - must be built on each target OS
 ```
 
@@ -257,23 +259,26 @@ If key learning does not work on macOS, allow this tool under
 ## Repository layout
 
 ```
-t1-keyboard-config          the program (single file / executable / all 3 OSes)
-99-t1-keyboard.rules        udev rule (Linux only)
-install.sh / uninstall.sh   installer / uninstaller
-tests/test_protocol.py      protocol encoder golden tests
-tests/test_monitor.py       monitor -> OSC integration test
-tests/test_platform.py      key tables / paths / input backends
-packaging/                  .deb and pacman package definitions
-build-release.sh            tarball build
-build-packages.sh           tarball + .deb + .pkg.tar.zst in one step
-LICENSE                     MIT
 README.md                   this file (English)
 README.ja.md                Japanese
 README.zh-CN.md             Simplified Chinese
 README.ko.md                Korean
+LICENSE                     MIT
+99-t1-keyboard.rules        udev rule (standalone copy, Linux only)
+linux/                      the program and everything used to build it
+  t1-keyboard-config        single-file program (executable, all 3 OSes)
+  99-t1-keyboard.rules      udev rule installed by install.sh
+  install.sh / uninstall.sh installer / uninstaller
+  tests/                    protocol / monitor / platform tests
+  packaging/                .deb and pacman package definitions
+  build-release.sh          tarball build
+  build-packages.sh         tarball + .deb + .pkg.tar.zst in one step
+dist/                       built artifacts (.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS)
+decompiled/, Release/       vendor sources and binaries, local only, not in the repo
 ```
 
-Tests: `python3 tests/test_protocol.py` and friends (41 total). Lint: `ruff check .`
+Tests and lint (run inside `linux/`): `python3 tests/test_protocol.py` and friends
+(41 total), `ruff check .`
 
 ---
 

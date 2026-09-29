@@ -7,6 +7,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGING="${SRC_DIR}/packaging"
+ROOT="$(cd "${SRC_DIR}/.." && pwd)"
 DIST="$(cd "${SRC_DIR}/.." && pwd)/dist"
 VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "${SRC_DIR}/t1-keyboard-config")"
 DEB_NAME="t1-keyboard-config_${VERSION}_amd64.deb"
@@ -29,11 +30,13 @@ stage_payload() {
     "${root}/usr/lib/udev/rules.d/99-t1-keyboard.rules"
   install -Dm644 "${PACKAGING}/t1-keyboard-config.desktop" \
     "${root}/usr/share/applications/t1-keyboard-config.desktop"
-  install -Dm644 "${SRC_DIR}/README.md" \
-    "${root}/usr/share/doc/t1-keyboard-config/README.md"
-  install -Dm644 "${SRC_DIR}/LICENSE" \
-    "${root}/usr/share/doc/t1-keyboard-config/copyright"
-  install -Dm644 "${SRC_DIR}/LICENSE" \
+  local doc="${root}/usr/share/doc/t1-keyboard-config"
+  install -Dm644 "${ROOT}/README.md"      "${doc}/README.md"
+  install -Dm644 "${ROOT}/README.ja.md"   "${doc}/README.ja.md"
+  install -Dm644 "${ROOT}/README.zh-CN.md" "${doc}/README.zh-CN.md"
+  install -Dm644 "${ROOT}/README.ko.md"   "${doc}/README.ko.md"
+  install -Dm644 "${ROOT}/LICENSE"        "${doc}/copyright"
+  install -Dm644 "${ROOT}/LICENSE" \
     "${root}/usr/share/licenses/t1-keyboard-config/LICENSE"
 }
 

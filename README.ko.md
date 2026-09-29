@@ -62,6 +62,8 @@ tar xzf dist/t1-keyboard-linux-<ver>.tar.gz && cd t1-keyboard-linux-<ver> && ./i
 
 ### 소스에서 설치 (모든 OS)
 
+아래 명령은 클론한 저장소의 `linux/` 디렉터리에서 실행합니다(`cd linux`).
+
 ```bash
 ./install.sh              # GUI + (Linux라면) udev 규칙
 ./install.sh --autostart  # 다이얼/OSC 모니터를 로그인 시에도 자동 시작
@@ -217,7 +219,7 @@ t1-keyboard-config --selftest --write
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config t1-keyboard-config
+pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
 # 출력: dist/t1-keyboard-config(.exe)   ※각 OS에서 빌드해야 합니다
 ```
 
@@ -251,23 +253,26 @@ macOS에서 키 학습이 안 되면 "시스템 설정 → 개인정보 보호 �
 ## 저장소 구성
 
 ```
-t1-keyboard-config          본체 (단일 파일 / 실행 가능 / 3 OS 공통)
-99-t1-keyboard.rules        udev 규칙 (Linux 전용)
-install.sh / uninstall.sh   설치 / 삭제 스크립트
-tests/test_protocol.py      프로토콜 인코더 골든 테스트
-tests/test_monitor.py       모니터 → OSC 통합 테스트
-tests/test_platform.py      키 테이블 / 경로 / 입력 백엔드 테스트
-packaging/                  .deb / pacman 패키지 정의
-build-release.sh            tarball 생성
-build-packages.sh           tarball + .deb + .pkg.tar.zst 일괄 생성
-LICENSE                     MIT
 README.md                   영어판
 README.ja.md                일본어판
 README.zh-CN.md             중국어(간체)판
 README.ko.md                이 파일 (한국어)
+LICENSE                     MIT
+99-t1-keyboard.rules        udev 규칙 (독립 사본 / Linux 전용)
+linux/                      본체와 빌드에 필요한 모든 것
+  t1-keyboard-config        단일 파일 본체 (실행 가능 / 3 OS 공통)
+  99-t1-keyboard.rules      install.sh이 설치하는 udev 규칙
+  install.sh / uninstall.sh 설치 / 삭제 스크립트
+  tests/                    프로토콜 / 모니터 / 플랫폼 테스트
+  packaging/                .deb / pacman 패키지 정의
+  build-release.sh          tarball 생성
+  build-packages.sh         tarball + .deb + .pkg.tar.zst 일괄 생성
+dist/                       빌드 산출물 (.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS)
+decompiled/, Release/       벤더 자산 (로컬에만 두고 저장소에는 포함하지 않음)
 ```
 
-테스트: `python3 tests/test_protocol.py` 외 (총 41건). lint: `ruff check .`
+테스트와 lint (`linux/` 안에서 실행): `python3 tests/test_protocol.py` 외(총 41건),
+`ruff check .`
 
 ---
 

@@ -62,6 +62,8 @@ tar xzf dist/t1-keyboard-linux-<ver>.tar.gz && cd t1-keyboard-linux-<ver> && ./i
 
 ### ソースから(全 OS 共通)
 
+以降のコマンドはクローンしたリポジトリの `linux/` ディレクトリで実行します(`cd linux`)。
+
 ```bash
 ./install.sh              # GUI + (Linux なら) udev ルール
 ./install.sh --autostart  # ダイヤル/OSC 監視をログイン時にも自動起動
@@ -218,7 +220,7 @@ t1-keyboard-config --selftest --write
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name t1-keyboard-config t1-keyboard-config
+pyinstaller --onefile --windowed --name t1-keyboard-config linux/t1-keyboard-config
 # 生成物: dist/t1-keyboard-config(.exe)   ※各 OS 上でビルドする必要があります
 ```
 
@@ -253,23 +255,26 @@ macOS でキー学習が動かない場合は「システム設定 → プライ
 ## リポジトリ構成
 
 ```
-t1-keyboard-config          本体 (単一ファイル / 実行可能 / 3 OS 共通)
-99-t1-keyboard.rules        udev ルール (Linux のみ)
-install.sh / uninstall.sh   インストーラ / アンインストーラ
-tests/test_protocol.py      プロトコルエンコーダのゴールデンテスト
-tests/test_monitor.py       モニタ → OSC の結合テスト
-tests/test_platform.py      キーテーブル / パス / 入力バックエンドのテスト
-packaging/                  .deb / pacman 用のパッケージ定義
-build-release.sh            tarball 生成
-build-packages.sh           tarball + .deb + .pkg.tar.zst 一括生成
-LICENSE                     MIT
 README.md                   英語版
 README.ja.md                このファイル (日本語)
 README.zh-CN.md             簡体字中国語版
 README.ko.md                韓国語版
+LICENSE                     MIT
+99-t1-keyboard.rules        udev ルール (単体コピー / Linux のみ)
+linux/                      本体とビルドに使うものすべて
+  t1-keyboard-config        単一ファイルの本体 (実行可能 / 3 OS 共通)
+  99-t1-keyboard.rules      install.sh が入れる udev ルール
+  install.sh / uninstall.sh インストーラ / アンインストーラ
+  tests/                    プロトコル / モニタ / プラットフォームのテスト
+  packaging/                .deb / pacman 用のパッケージ定義
+  build-release.sh          tarball 生成
+  build-packages.sh         tarball + .deb + .pkg.tar.zst 一括生成
+dist/                       生成物 (.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS)
+decompiled/, Release/       ベンダー資産 (ローカルのみ、リポジトリには含めない)
 ```
 
-テスト: `python3 tests/test_protocol.py` ほか(計41件)。lint: `ruff check .`
+テストと lint (`linux/` 内で実行): `python3 tests/test_protocol.py` ほか(計41件)、
+`ruff check .`
 
 ---
 
