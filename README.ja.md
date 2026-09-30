@@ -12,7 +12,7 @@ Photoshop 用 USB メカニカルキーボード」](https://ja.aliexpress.com/i
 | 対応 OS | 状態 |
 | --- | --- |
 | Linux (Arch / Omarchy 推奨) | 実機検証済み(書き込み・モニタ・GUI) |
-| Windows 11 | 実装済み **未検証**(この環境に Windows が無いため) |
+| Windows 11 | 実機検証済み 2026-09-30(書き込み・モニタ・GUI・インストーラ) |
 | macOS | 実装済み **未検証**(この環境に macOS が無いため) |
 
 - キー割り当て(最大5グループのコンボ)、修飾キー、マルチメディア、マウス、LED
@@ -81,6 +81,16 @@ tar xzf dist/t1-keyboard-linux-<ver>.tar.gz && cd t1-keyboard-linux-<ver> && ./i
 4. 最後に `--selftest` を自動実行して接続可否を表示
 
 アンインストール: `./uninstall.sh`
+
+### Windows 11 (インストーラ)
+
+リリースアセットの `t1-keyboard-config-<version>-setup.exe` をダウンロードして実行します。
+インストーラはスタートメニュー項目・デスクトップアイコン(任意)・ログイン時自動起動(任意、
+いずれも既定 OFF)を作成します。アンインストールは「アプリと機能」またはスタートメニューの
+ショートカットから行えます。
+
+> バイナリは未署名のため、Windows が SmartScreen 警告を表示することがあります。
+> 「詳細情報」→「実行する」を押して続行してください。
 
 ### Windows 11 / macOS (ソース実行)
 
@@ -249,10 +259,10 @@ pyinstaller --onefile --windowed --name "T1 Keyboard Config" linux/t1-keyboard-c
 ### 検証の範囲
 
 - Linux: 実機で検証済み(書き込み・モニタ・GUI)
+- Windows 11: 実機で検証済み 2026-09-30(書き込み・モニタ・GUI・インストーラ)
 - CI: 凍結バイナリが Windows 11 / macOS のランナー上で起動し、テストが通ること
-- Windows/macOS のデバイス I/O: CI では検証できません(キーボードが接続されていない)。
-  実機で `t1-keyboard-config --selftest`、または Windows 11 VM
-  (Hyper-V / KVM + USB パススルー)で確認してください
+- macOS のデバイス I/O: CI では検証できません(キーボードが接続されていない)。
+  実機で `t1-keyboard-config --selftest` を実行して確認してください
 
 ### 署名
 
@@ -278,7 +288,7 @@ macOS でキー学習が動かない場合は「システム設定 → プライ
 - ファームウェアからの設定読み出しは存在しないため、書き込み結果は本体側で確認する必要があります
 - 学習(ダイヤル押し込み / キーコード)は本体の実装に依存するため、初回に1回ずつ実施してください
 - Windows 版の「K3」「KEY13〜16」ボタンは元バイナリでも未実装のため本ツールにもありません
-- **Windows/macOS の書き込み・入力バックエンドは未検証**です(開発環境に該当 OS が無いため)。
+- **macOS の書き込み・入力バックエンドは未検証**です(開発環境に macOS が無いため)。
   実機で `--selftest` を必ず実行してください。失敗時はエラー内容がトースト/標準出力に出ます
 - Windows のキーコードはキーボードレイアウト依存の VK を evdev に変換しています
   (日本語配列の特殊キーなど一部は学習対象外)
@@ -304,6 +314,12 @@ linux/                      本体とビルドに使うものすべて
   build-release.sh          tarball 生成
   build-packages.sh         tarball + .deb + .pkg.tar.zst 一括生成
 dist/                       生成物 (.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS)
+dist-win/                      Windows 生成物 (.exe / setup.exe)
+windows/                       Windows 配布ファイル
+  t1-keyboard-config.spec     PyInstaller spec (console exe)
+  t1-keyboard-config-gui.spec PyInstaller spec (windowed GUI exe)
+  installer.iss               Inno Setup インストーラスクリプト
+  version.txt                Windows バージョンリソース
 decompiled/, Release/       ベンダー資産 (ローカルのみ、リポジトリには含めない)
 ```
 

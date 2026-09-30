@@ -11,7 +11,7 @@ English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국�
 | Target OS | Status |
 | --- | --- |
 | Linux (Arch / Omarchy recommended) | Verified on hardware (writes, monitor, GUI) |
-| Windows 11 | Implemented, **not verified** (no Windows machine in this environment) |
+| Windows 11 | Verified on hardware 2026-09-30 (writes, monitor, GUI, installer) |
 | macOS | Implemented, **not verified** (no macOS machine in this environment) |
 
 - Key assignments (up to 5 combos per key), modifier keys, multimedia, mouse, LEDs
@@ -81,6 +81,16 @@ The commands below run from the `linux/` directory of a clone (`cd linux`).
 4. Runs `--selftest` at the end to report whether the device is usable
 
 Uninstall: `./uninstall.sh`
+
+### Windows 11 (installer)
+
+Download `t1-keyboard-config-<version>-setup.exe` from the release assets and run it.
+The installer creates a start-menu entry, an optional desktop icon and an optional
+logon autostart (both off by default). Uninstall via "Apps & features" or the
+start-menu shortcut.
+
+> The binaries are unsigned: Windows may show a SmartScreen warning. Click
+> "More info" -> "Run anyway" to proceed.
 
 ### Windows 11 / macOS (run from source)
 
@@ -249,10 +259,10 @@ pyinstaller --onefile --windowed --name "T1 Keyboard Config" linux/t1-keyboard-c
 ### What is verified where
 
 - Linux: real hardware - writes, monitor and GUI all verified
+- Windows 11: real hardware 2026-09-30 - writes, monitor, GUI and installer verified
 - CI: the frozen binaries start on the Windows 11 / macOS runners and the test suite passes
-- Device I/O on Windows/macOS: **not** covered by CI (no keyboard attached). Run
-  `t1-keyboard-config --selftest` on the machine, or inside a Windows 11 VM
-  (Hyper-V / KVM with USB passthrough of the keypad)
+- Device I/O on macOS: **not** covered by CI (no keyboard attached). Run
+  `t1-keyboard-config --selftest` on the machine
 
 ### Signing
 
@@ -280,7 +290,7 @@ If key learning does not work on macOS, allow this tool under
 - Learning (dial press / key codes) depends on the hardware; do it once on first use
 - The Windows app's "K3" and "KEY13–16" buttons are unimplemented in the original binary,
   so they are absent here as well
-- **The Windows/macOS write and input backends are unverified** (no such OS in this
+- **The macOS write and input backends are unverified** (no macOS machine in this
   development environment). Always run `--selftest` on the real machine; failures are
   reported in the toast / stdout
 - Windows key codes convert layout-dependent VK values to evdev codes (some Japanese-layout
@@ -307,6 +317,12 @@ linux/                      the program and everything used to build it
   build-release.sh          tarball build
   build-packages.sh         tarball + .deb + .pkg.tar.zst in one step
 dist/                       built artifacts (.tar.gz / .deb / .pkg.tar.zst / SHA256SUMS)
+dist-win/                      built Windows artifacts (.exe / setup.exe)
+windows/                       Windows distribution files
+  t1-keyboard-config.spec     PyInstaller spec (console exe)
+  t1-keyboard-config-gui.spec PyInstaller spec (windowed GUI exe)
+  installer.iss               Inno Setup installer script
+  version.txt                Windows version resource
 decompiled/, Release/       vendor sources and binaries, local only, not in the repo
 ```
 

@@ -536,7 +536,7 @@ def _win():
                                     wt.DWORD, ctypes.c_void_p, wt.DWORD,
                                     ctypes.POINTER(wt.DWORD), wt.LPVOID]
 
-    setupapi.HidD_GetHidGuid.argtypes = [ctypes.c_void_p]
+    hid.HidD_GetHidGuid.argtypes = [ctypes.c_void_p]
     setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
     setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, wt.LPCWSTR,
                                               wt.LPCWSTR, wt.DWORD]
@@ -567,7 +567,7 @@ def win_find_device_path():
     wt, GUID = libs["wt"], libs["GUID"]
     setupapi = libs["setupapi"]
     guid = GUID()
-    setupapi.HidD_GetHidGuid(ctypes.byref(guid))
+    libs["hid"].HidD_GetHidGuid(ctypes.byref(guid))
     hdev = setupapi.SetupDiGetClassDevsW(
         ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
     if hdev in (None, INVALID_HANDLE_VALUE, 0):

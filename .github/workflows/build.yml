@@ -46,7 +46,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: windows (.exe)
+    name: windows (.exe + installer)
     runs-on: windows-latest
     defaults:
       run:
@@ -64,14 +64,18 @@ jobs:
           python3 tests/test_protocol.py
           python3 tests/test_platform.py
       - name: Build console exe
-        run: pyinstaller --noconfirm --onefile --name t1-keyboard-config --distpath ../dist-win t1-keyboard-config
+        run: pyinstaller --noconfirm ../windows/t1-keyboard-config.spec
       - name: Build windowed (GUI) exe
-        run: pyinstaller --noconfirm --onefile --windowed --name t1-keyboard-config-gui --distpath ../dist-win t1-keyboard-config
+        run: pyinstaller --noconfirm ../windows/t1-keyboard-config-gui.spec
       - name: Launch smoke test
         run: |
           ../dist-win/t1-keyboard-config.exe --version
           ../dist-win/t1-keyboard-config.exe --help > /dev/null
           ../dist-win/t1-keyboard-config-gui.exe --version
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+      - name: Build installer
+        run: iscc ../windows/installer.iss
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64

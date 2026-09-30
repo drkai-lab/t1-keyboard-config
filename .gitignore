@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 *.spec
+!windows/*.spec
 build/
 decompiled/
 Release/
+dist-win/
