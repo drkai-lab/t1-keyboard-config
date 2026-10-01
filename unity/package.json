@@ -1,0 +1,28 @@
+{
+  "name": "com.drkai-lab.t1-expression",
+  "version": "1.0.0",
+  "displayName": "T1 Expression Bridge",
+  "description": "Connect your T1 keyboard to avatar expressions via OSC. Beginner-friendly GUI for mapping T1 keys to expression parameters.",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "dependencies": {},
+  "keywords": [
+    "T1",
+    "keyboard",
+    "OSC",
+    "expression",
+    "VRChat",
+    "avatar"
+  ],
+  "author": {
+    "name": "drkai-lab",
+    "url": "https://github.com/drkai-lab/t1-keyboard-config"
+  },
+  "samples": [
+    {
+      "displayName": "Sample Scene",
+      "description": "A sample scene demonstrating the T1 Expression Bridge setup",
+      "path": "Samples~/SampleScene"
+    }
+  ]
+}
