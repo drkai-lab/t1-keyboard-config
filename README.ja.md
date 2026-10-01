@@ -295,6 +295,44 @@ macOS でキー学習が動かない場合は「システム設定 → プライ
 
 ---
 
+## Unity T1 Expression Bridge
+
+T1キーボードをアバターの表情とOSCで結び付けるUnityパッケージです。
+初心者向け：コード不要でGUIだけで設定できます。
+
+### インストール
+
+**Unity Package Manager**（推奨）:
+1. `Window > Package Manager` を開く
+2. `+` > `Add package from git URL` をクリック
+3. `https://github.com/drkai-lab/t1-keyboard-config.git?path=unity` を入力
+4. `Add` をクリック
+
+**手動**: `unity/` フォルダをプロジェクトの `Assets/` にコピー。
+
+### クイックスタート
+
+1. **セットアップ**: メニュー `Tools > T1 Expression > Setup Bridge`
+2. **設定**: メニュー `Tools > T1 Expression Settings`
+   - OSCポートを設定（デフォルト9000）
+   - アバターの Animator を割り当て（任意）
+   - マッピングを追加：T1キー → OSCアドレス → 表情パラメータ
+3. **実行**: T1キーボードツールを起動（`vrc-hotkey-osc` または `t1-keyboard-config --monitor`）
+4. **T1キーを押す** と表情が切り替わります
+
+### 主な機能
+
+- 設定可能なUDPポートでOSC受信
+- VRChat `VRCExpressionParameters` 対応
+- 汎用 `Animator` の Bool/Int/Float パラメータ対応
+- プリセット表情名（FaceHappy、FaceSad、HandThumbsUpなど）
+- マッピングごとのテストトリガー（ゲーム実行不要）
+- ワンクリックデフォルトマッピング（KEY1-10 → Expression1-10）
+
+詳細は `unity/README.md` を参照してください。
+
+---
+
 ## リポジトリ構成
 
 ```

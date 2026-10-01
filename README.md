@@ -298,6 +298,44 @@ If key learning does not work on macOS, allow this tool under
 
 ---
 
+## Unity T1 Expression Bridge
+
+A Unity package that connects your T1 keyboard to avatar expressions via OSC.
+Beginner-friendly: configure everything from a GUI, no code required.
+
+### Installation
+
+**Unity Package Manager** (recommended):
+1. Open `Window > Package Manager`
+2. Click `+` > `Add package from git URL`
+3. Enter: `https://github.com/drkai-lab/t1-keyboard-config.git?path=unity`
+4. Click `Add`
+
+**Manual**: copy the `unity/` folder into your project's `Assets/` directory.
+
+### Quick Start
+
+1. **Setup**: Menu `Tools > T1 Expression > Setup Bridge`
+2. **Configure**: Menu `Tools > T1 Expression Settings`
+   - Set OSC port (default 9000)
+   - Assign your avatar's Animator (optional)
+   - Add mappings: T1 key → OSC address → expression parameter
+3. **Run**: Start your T1 keyboard tool (`vrc-hotkey-osc` or `t1-keyboard-config --monitor`)
+4. **Press T1 keys** to trigger expressions
+
+### Features
+
+- OSC receiver on configurable UDP port
+- VRChat `VRCExpressionParameters` support
+- Generic `Animator` Bool/Int/Float parameter support
+- Preset expression names (FaceHappy, FaceSad, HandThumbsUp, etc.)
+- Test trigger per mapping (no game run needed)
+- One-click default mappings (KEY1-10 → Expression1-10)
+
+See `unity/README.md` for the full guide.
+
+---
+
 ## Repository layout
 
 ```
